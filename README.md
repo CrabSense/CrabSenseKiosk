@@ -1,6 +1,49 @@
-# CrabSenseKiosk
+# CrabSenseKiosk - API RESTful
 
 > **Edge gateway lắp tại trại nuôi** — nhận data từ **IoT** + **AI Water Quality**, đóng gói **HDF5**, sync lên **CrabSenseBE**.
+
+## 🚀 API Documentation
+
+API RESTful được xây dựng bằng **ASP.NET Core 8.0** với các tính năng:
+
+- ✅ Quản lý cảm biến (Sensors)
+- ✅ Ghi nhận và phân tích chất lượng nước
+- ✅ Phát hiện bất thường tự động
+- ✅ Hệ thống cảnh báo thông minh
+- ✅ Thống kê và báo cáo
+- ✅ Swagger UI Documentation
+- ✅ Logging với Serilog
+
+### Chạy API
+
+```bash
+dotnet run
+```
+
+API: `https://localhost:5001` | Swagger UI: `https://localhost:5001/`
+
+### API Endpoints
+
+**Health Check:**
+- `GET /api/health` - Kiểm tra trạng thái API
+- `GET /api/health/detailed` - Chi tiết hệ thống
+
+**Water Quality:**
+- `POST /api/waterquality` - Tạo bản đọc mới
+- `GET /api/waterquality/{id}` - Lấy bản đọc theo ID
+- `GET /api/waterquality` - Danh sách (phân trang)
+- `GET /api/waterquality/latest` - Các bản đọc mới nhất
+- `GET /api/waterquality/statistics` - Thống kê
+
+**Sensors:**
+- `POST /api/sensor` - Tạo sensor
+- `GET /api/sensor` - Danh sách sensors
+- `GET /api/sensor/active` - Sensors hoạt động
+- `PUT /api/sensor/{id}` - Cập nhật
+- `PATCH /api/sensor/{id}/toggle` - Bật/tắt
+
+**Alerts:**
+- `GET /api/alert/active` - Cảnh báo đang hoạt động
 
 ## Phạm vi (quan trọng)
 
