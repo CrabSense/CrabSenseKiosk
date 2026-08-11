@@ -1,0 +1,62 @@
+name: SonarCloud
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: sonar-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sonarcloud:
+    name: SonarCloud Scan (.NET)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Cache SonarCloud
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar-kiosk
+          restore-keys: ${{ runner.os }}-sonar-kiosk
+
+      - name: Install SonarScanner
+        run: dotnet tool install --global dotnet-sonarscanner
+
+      - name: Begin SonarCloud
+        if: env.SONAR_TOKEN != ''
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          dotnet sonarscanner begin \
+            /k:"CrabSense_CrabSenseKiosk" \
+            /o:"crabsense" \
+            /d:sonar.token="${{ secrets.SONAR_TOKEN }}" \
+            /d:sonar.host.url="https://sonarcloud.io" \
+            /d:sonar.exclusions="**/bin/**,**/obj/**,**/docs/**"
+
+      - name: Build
+        run: |
+          if [ -f CrabSenseKiosk.csproj ]; then
+            dotnet build CrabSenseKiosk.csproj -c Release
+          elif [ -f CrabSenseKiosk.sln ]; then
+            dotnet build CrabSenseKiosk.sln -c Release
+          else
+            dotnet build -c Release
+          fi
+
+      - name: End SonarCloud
+        if: env.SONAR_TOKEN != '' && always()
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
