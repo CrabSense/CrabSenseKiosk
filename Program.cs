@@ -61,6 +61,7 @@ try
     builder.Services.AddScoped<IWaterQualityService, WaterQualityService>();
     builder.Services.AddScoped<ISensorService, SensorService>();
     builder.Services.AddScoped<IAlertService, AlertService>();
+    builder.Services.AddSingleton<ITelemetryService, TelemetryService>();
 
     var app = builder.Build();
 
