@@ -26,6 +26,9 @@ public sealed class TelemetryReadingDto
     [JsonPropertyName("pin")]
     public int Pin { get; set; }
 
+    [JsonPropertyName("sensor")]
+    public string? SensorCode { get; set; }
+
     [JsonPropertyName("val")]
     public double Value { get; set; }
 }

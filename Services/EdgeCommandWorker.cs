@@ -10,6 +10,8 @@ public sealed class EdgeCommandWorker : BackgroundService
     private readonly IHttpClientFactory _httpClients;
     private readonly EdgeGatewayOptions _options;
     private readonly ILogger<EdgeCommandWorker> _logger;
+    private readonly Dictionary<string, DateTime> _lastForwarded = new(
+        StringComparer.OrdinalIgnoreCase);
 
     public EdgeCommandWorker(
         ITelemetryService telemetry,
@@ -48,6 +50,7 @@ public sealed class EdgeCommandWorker : BackgroundService
             try
             {
                 var client = _httpClients.CreateClient();
+                await ForwardTelemetryAsync(snapshot, backend, client, ct);
                 using var request = new HttpRequestMessage(
                     HttpMethod.Get,
                     $"{backend}/api/edge/commands/pending" +
@@ -76,6 +79,45 @@ public sealed class EdgeCommandWorker : BackgroundService
                     ex.Message);
             }
         }
+    }
+
+    private async Task ForwardTelemetryAsync(
+        DTOs.TelemetrySnapshot snapshot,
+        string backend,
+        HttpClient client,
+        CancellationToken ct)
+    {
+        if (_lastForwarded.TryGetValue(snapshot.DeviceCode, out var last)
+            && DateTime.UtcNow - last
+                < TimeSpan.FromSeconds(_options.TelemetryForwardIntervalSeconds))
+            return;
+
+        var measurements = snapshot.Readings.Select(reading => new
+        {
+            deviceCode = snapshot.DeviceCode,
+            sensorCode = string.IsNullOrWhiteSpace(reading.SensorCode)
+                ? $"{snapshot.DeviceCode}-float-{reading.Pin}"
+                : $"{snapshot.DeviceCode}-{reading.SensorCode}",
+            value = reading.Value,
+            unit = "state",
+            measuredAt = snapshot.ReceivedAt,
+            ipAddress = snapshot.IpAddress
+        });
+
+        using var response = await client.PostAsJsonAsync(
+            $"{backend}/api/iot/sensor-data/batch",
+            new { measurements },
+            ct);
+        if (!response.IsSuccessStatusCode)
+        {
+            _logger.LogWarning(
+                "BE telemetry forward failed for {DeviceCode}: {StatusCode}",
+                snapshot.DeviceCode,
+                response.StatusCode);
+            return;
+        }
+
+        _lastForwarded[snapshot.DeviceCode] = DateTime.UtcNow;
     }
 
     private async Task ForwardAsync(

@@ -27,6 +27,7 @@ public sealed class TelemetryService : ITelemetryService
                 .Select(reading => new TelemetryReadingDto
                 {
                     Pin = reading.Pin,
+                    SensorCode = reading.SensorCode,
                     Value = reading.Value
                 })
                 .ToArray());
