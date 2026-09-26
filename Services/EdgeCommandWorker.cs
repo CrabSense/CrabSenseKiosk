@@ -96,8 +96,8 @@ public sealed class EdgeCommandWorker : BackgroundService
         {
             deviceCode = snapshot.DeviceCode,
             sensorCode = string.IsNullOrWhiteSpace(reading.SensorCode)
-                ? $"{snapshot.DeviceCode}-float-{reading.Pin}"
-                : $"{snapshot.DeviceCode}-{reading.SensorCode}",
+                ? $"float_{reading.Pin}"
+                : reading.SensorCode,
             value = reading.Value,
             unit = "state",
             measuredAt = snapshot.ReceivedAt,
