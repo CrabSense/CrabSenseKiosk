@@ -8,8 +8,14 @@ namespace CrabSenseKiosk.DTOs;
 /// </summary>
 public sealed class TelemetryPayload
 {
+    [JsonPropertyName("deviceCode")]
+    public string? DeviceCode { get; set; }
+
     [JsonPropertyName("mac")]
     public string? Mac { get; set; }
+
+    [JsonPropertyName("ipAddress")]
+    public string? IpAddress { get; set; }
 
     [JsonPropertyName("readings")]
     public List<TelemetryReadingDto> Readings { get; set; } = [];
@@ -25,6 +31,8 @@ public sealed class TelemetryReadingDto
 }
 
 public sealed record TelemetrySnapshot(
+    string DeviceCode,
     string Mac,
+    string? IpAddress,
     DateTime ReceivedAt,
     IReadOnlyList<TelemetryReadingDto> Readings);

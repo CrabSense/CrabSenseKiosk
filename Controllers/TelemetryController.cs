@@ -41,7 +41,9 @@ public sealed class TelemetryController : ControllerBase
         return StatusCode(StatusCodes.Status201Created, new
         {
             ok = true,
+            deviceCode = snapshot.DeviceCode,
             mac = snapshot.Mac,
+            ipAddress = snapshot.IpAddress,
             receivedAt = snapshot.ReceivedAt,
             readingCount = snapshot.Readings.Count
         });
@@ -56,4 +58,8 @@ public sealed class TelemetryController : ControllerBase
             ? NotFound(new { ok = false, error = "No telemetry received" })
             : Ok(new { ok = true, data = snapshot });
     }
+
+    [HttpGet("/api/telemetry/snapshots")]
+    public ActionResult<object> Snapshots() =>
+        Ok(new { ok = true, data = _telemetry.GetAll() });
 }

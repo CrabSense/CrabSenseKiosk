@@ -15,8 +15,13 @@ public sealed class TelemetryService : ITelemetryService
     public TelemetrySnapshot Store(TelemetryPayload payload)
     {
         var mac = payload.Mac!.Trim();
+        var deviceCode = string.IsNullOrWhiteSpace(payload.DeviceCode)
+            ? mac
+            : payload.DeviceCode.Trim();
         var snapshot = new TelemetrySnapshot(
+            deviceCode,
             mac,
+            string.IsNullOrWhiteSpace(payload.IpAddress) ? null : payload.IpAddress.Trim(),
             DateTime.UtcNow,
             payload.Readings
                 .Select(reading => new TelemetryReadingDto
@@ -39,4 +44,7 @@ public sealed class TelemetryService : ITelemetryService
             .OrderByDescending(snapshot => snapshot.ReceivedAt)
             .FirstOrDefault();
     }
+
+    public IReadOnlyList<TelemetrySnapshot> GetAll() =>
+        _latest.Values.OrderByDescending(snapshot => snapshot.ReceivedAt).ToArray();
 }

@@ -24,6 +24,9 @@ try
     // Add services to the container
     builder.Services.AddControllers();
     builder.Services.AddEndpointsApiExplorer();
+    builder.Services.AddHttpClient();
+    builder.Services.Configure<EdgeGatewayOptions>(
+        builder.Configuration.GetSection(EdgeGatewayOptions.SectionName));
     
     // Configure Swagger
     builder.Services.AddSwaggerGen(c =>
@@ -62,6 +65,7 @@ try
     builder.Services.AddScoped<ISensorService, SensorService>();
     builder.Services.AddScoped<IAlertService, AlertService>();
     builder.Services.AddSingleton<ITelemetryService, TelemetryService>();
+    builder.Services.AddHostedService<EdgeCommandWorker>();
 
     var app = builder.Build();
 
@@ -79,7 +83,8 @@ try
         });
     }
 
-    app.UseHttpsRedirection();
+    if (builder.Configuration.GetValue<bool>("Kiosk:UseHttpsRedirection"))
+        app.UseHttpsRedirection();
 
     app.UseCors("AllowAll");
 
