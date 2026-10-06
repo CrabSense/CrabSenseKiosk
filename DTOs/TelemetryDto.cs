@@ -31,6 +31,9 @@ public sealed class TelemetryReadingDto
 
     [JsonPropertyName("val")]
     public double Value { get; set; }
+
+    [JsonPropertyName("unit")]
+    public string? Unit { get; set; }
 }
 
 public sealed record TelemetrySnapshot(

@@ -28,7 +28,8 @@ public sealed class TelemetryService : ITelemetryService
                 {
                     Pin = reading.Pin,
                     SensorCode = reading.SensorCode,
-                    Value = reading.Value
+                    Value = reading.Value,
+                    Unit = reading.Unit
                 })
                 .ToArray());
 

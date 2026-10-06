@@ -99,7 +99,7 @@ public sealed class EdgeCommandWorker : BackgroundService
                 ? $"float_{reading.Pin}"
                 : reading.SensorCode,
             value = reading.Value,
-            unit = "state",
+            unit = string.IsNullOrWhiteSpace(reading.Unit) ? "state" : reading.Unit,
             measuredAt = snapshot.ReceivedAt,
             ipAddress = snapshot.IpAddress
         });
