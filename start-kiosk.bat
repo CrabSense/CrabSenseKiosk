@@ -1,36 +1,46 @@
 @echo off
 cd /d "%~dp0"
-set "URLFILE=%~dp0be-url.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup-kiosk.ps1" -Status
+set "ST=%ERRORLEVEL%"
+echo.
 set "BE_URL="
-if exist "%URLFILE%" for /f "usebackq delims=" %%A in ("%URLFILE%") do set "BE_URL=%%A"
+if exist "%~dp0be-url.txt" for /f "usebackq delims=" %%A in ("%~dp0be-url.txt") do set "BE_URL=%%A"
+echo Step 1. Backend URL
+echo Current URL: %BE_URL%
+set "NEW="
+set /p NEW=Enter a new URL, or press Enter to keep the current one: 
+if not "%NEW%"=="" set "BE_URL=%NEW%"
+echo %BE_URL% | findstr /i /r "^http://" >nul
+if errorlevel 1 (
+  echo %BE_URL% | findstr /i /r "^https://" >nul
+  if errorlevel 1 (
+    echo The URL must start with http:// or https://.
+    exit /b 1
+  )
+)
+>"%~dp0be-url.txt" echo %BE_URL%
+echo.
+echo Step 2. Provisioning code
+set "CODE="
+set /p CODE=Enter provisioning code: 
+if "%CODE%"=="" goto emptycode
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup-kiosk.ps1" -BeUrl "%BE_URL%" -Code "%CODE%"
+if errorlevel 1 exit /b 1
+goto listen
 
-if "%BE_URL%"=="" goto asknew
-
-:askchange
-echo BE hien tai: %BE_URL%
-set "CHANGE="
-set /p CHANGE=Thay doi? (yes/no): 
-if /i "%CHANGE%"=="yes" goto asknew
-if /i "%CHANGE%"=="no" goto start
-echo Chi nhap yes hoac no
-goto askchange
-
-:asknew
-set "BE_URL="
-set /p BE_URL=Nhap link BE: 
-if "%BE_URL%"=="" (
-  echo Chua nhap link BE
+:emptycode
+if not "%ST%"=="0" (
+  echo Enter a provisioning code. The previous credential was revoked.
   exit /b 1
 )
->"%URLFILE%" echo %BE_URL%
 
-:start
+:listen
 netstat -ano | findstr ":8090" | findstr "LISTENING" >nul
 if not errorlevel 1 (
-  echo Kiosk da lang nghe cong 8090. Tat cua so do roi chay lai de dung link moi.
+  echo Kiosk is already listening on port 8090. Close that window, then run this again.
   exit /b 0
 )
-echo Bat Kiosk http://0.0.0.0:8090
-echo BE: %BE_URL%
+echo Starting Kiosk at http://0.0.0.0:8090
+echo Backend: %BE_URL%
 set "EdgeGateway__BackendUrl=%BE_URL%"
 dotnet run --urls "http://0.0.0.0:8090" --no-launch-profile

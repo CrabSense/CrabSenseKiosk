@@ -114,6 +114,13 @@ try
         }
     }
 
+    var backend = app.Configuration["EdgeGateway:BackendUrl"];
+    var hasSecret = File.Exists(Path.Combine(app.Environment.ContentRootPath, "kiosk-secret.txt"));
+    Log.Information(
+        "Kiosk is ready. Backend {Backend}. Credential: {Credential}",
+        backend,
+        hasSecret ? "granted" : "missing");
+
     app.Run();
 }
 catch (Exception ex)

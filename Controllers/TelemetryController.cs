@@ -8,13 +8,16 @@ namespace CrabSenseKiosk.Controllers;
 public sealed class TelemetryController : ControllerBase
 {
     private readonly ITelemetryService _telemetry;
+    private readonly IControllerRegistry _controllers;
     private readonly ILogger<TelemetryController> _logger;
 
     public TelemetryController(
         ITelemetryService telemetry,
+        IControllerRegistry controllers,
         ILogger<TelemetryController> logger)
     {
         _telemetry = telemetry;
+        _controllers = controllers;
         _logger = logger;
     }
 
@@ -31,6 +34,21 @@ public sealed class TelemetryController : ControllerBase
 
         if (payload.Readings.Any(reading => reading.Pin <= 0 || !double.IsFinite(reading.Value)))
             return BadRequest(new { ok = false, error = "readings contains an invalid pin or value" });
+
+        var deviceCode = string.IsNullOrWhiteSpace(payload.DeviceCode)
+            ? payload.Mac.Trim()
+            : payload.DeviceCode.Trim();
+        if (!_controllers.IsAccepted(deviceCode))
+        {
+            if (_controllers.MarkIgnored(deviceCode))
+            {
+                _logger.LogInformation(
+                    "Ignoring telemetry from {DeviceCode} until the controller is approved.",
+                    deviceCode);
+            }
+
+            return Accepted(new { ok = true, ignored = true, deviceCode });
+        }
 
         var snapshot = _telemetry.Store(payload);
         _logger.LogInformation(

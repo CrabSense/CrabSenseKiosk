@@ -33,7 +33,15 @@ public sealed class EdgeCommandWorker : BackgroundService
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            await PollOnceAsync(stoppingToken);
+            try
+            {
+                await PollOnceAsync(stoppingToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning("Edge poll skipped: {Message}", ex.Message);
+            }
+
             await Task.Delay(
                 TimeSpan.FromSeconds(Math.Max(1, _options.PollIntervalSeconds)),
                 stoppingToken);
@@ -42,13 +50,19 @@ public sealed class EdgeCommandWorker : BackgroundService
 
     private async Task PollOnceAsync(CancellationToken ct)
     {
-        var backend = _options.BackendUrl.TrimEnd('/');
-        if (string.IsNullOrWhiteSpace(backend))
+        var backend = _options.BackendUrl.Trim().TrimEnd('/');
+        if (!backend.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            && !backend.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogWarning("Skipping backend because the URL is invalid: {Backend}", backend);
             return;
+        }
 
         foreach (var snapshot in _telemetry.GetAll())
         {
             if (string.IsNullOrWhiteSpace(snapshot.IpAddress))
+                continue;
+            if (!_controllers.IsAccepted(snapshot.DeviceCode))
                 continue;
             if (_controllers.IsBlocked(snapshot.DeviceCode))
             {
