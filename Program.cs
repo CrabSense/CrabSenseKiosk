@@ -27,6 +27,12 @@ try
     builder.Services.AddHttpClient();
     builder.Services.Configure<EdgeGatewayOptions>(
         builder.Configuration.GetSection(EdgeGatewayOptions.SectionName));
+    var kioskSecretFile = Path.Combine(builder.Environment.ContentRootPath, "kiosk-secret.txt");
+    if (File.Exists(kioskSecretFile))
+    {
+        var kioskSecret = File.ReadAllText(kioskSecretFile).Trim();
+        builder.Services.PostConfigure<EdgeGatewayOptions>(options => options.KioskSecret = kioskSecret);
+    }
     
     // Configure Swagger
     builder.Services.AddSwaggerGen(c =>
@@ -65,6 +71,7 @@ try
     builder.Services.AddScoped<ISensorService, SensorService>();
     builder.Services.AddScoped<IAlertService, AlertService>();
     builder.Services.AddSingleton<ITelemetryService, TelemetryService>();
+    builder.Services.AddSingleton<IControllerRegistry, ControllerRegistry>();
     builder.Services.AddHostedService<EdgeCommandWorker>();
 
     var app = builder.Build();

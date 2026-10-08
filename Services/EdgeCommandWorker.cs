@@ -13,15 +13,19 @@ public sealed class EdgeCommandWorker : BackgroundService
     private readonly Dictionary<string, DateTime> _lastForwarded = new(
         StringComparer.OrdinalIgnoreCase);
 
+    private readonly IControllerRegistry _controllers;
+
     public EdgeCommandWorker(
         ITelemetryService telemetry,
         IHttpClientFactory httpClients,
         IOptions<EdgeGatewayOptions> options,
+        IControllerRegistry controllers,
         ILogger<EdgeCommandWorker> logger)
     {
         _telemetry = telemetry;
         _httpClients = httpClients;
         _options = options.Value;
+        _controllers = controllers;
         _logger = logger;
     }
 
@@ -46,6 +50,11 @@ public sealed class EdgeCommandWorker : BackgroundService
         {
             if (string.IsNullOrWhiteSpace(snapshot.IpAddress))
                 continue;
+            if (_controllers.IsBlocked(snapshot.DeviceCode))
+            {
+                _logger.LogWarning("Skip telemetry for rejected controller {DeviceCode}", snapshot.DeviceCode);
+                continue;
+            }
 
             try
             {
