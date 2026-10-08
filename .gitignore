@@ -71,3 +71,8 @@ logs/
 # appsettings
 appsettings.Development.json
 appsettings.Production.json
+
+# Link BE nhap luc chay start-kiosk.bat
+be-url.txt
+kiosk-secret.txt
+kiosk-identity.txt
