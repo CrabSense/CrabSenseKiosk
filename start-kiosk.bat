@@ -5,10 +5,31 @@ set "ST=%ERRORLEVEL%"
 echo.
 set "BE_URL="
 if exist "%~dp0be-url.txt" for /f "usebackq delims=" %%A in ("%~dp0be-url.txt") do set "BE_URL=%%A"
-echo Step 1. Backend URL
-echo Current URL: %BE_URL%
+
+if "%ST%"=="0" goto ready
+if "%ST%"=="1" goto offline
+goto revoked
+
+:ready
+echo Saved backend: %BE_URL%
+set "CHANGE="
+set /p CHANGE=Change the backend URL or provisioning code? Type Y to change, or press Enter to continue: 
+if /i "%CHANGE%"=="Y" goto askurl
+goto listen
+
+:offline
+echo The saved backend could not be reached: %BE_URL%
+echo Enter a new backend URL.
+goto askurl
+
+:revoked
+echo The kiosk credential is missing or was revoked.
+if "%BE_URL%"=="" goto askurl
+goto askcode
+
+:askurl
 set "NEW="
-set /p NEW=Enter a new URL, or press Enter to keep the current one: 
+set /p NEW=Backend URL [%BE_URL%]: 
 if not "%NEW%"=="" set "BE_URL=%NEW%"
 echo %BE_URL% | findstr /i /r "^http://" >nul
 if errorlevel 1 (
@@ -19,10 +40,12 @@ if errorlevel 1 (
   )
 )
 >"%~dp0be-url.txt" echo %BE_URL%
+if "%ST%"=="1" goto listen
+
+:askcode
 echo.
-echo Step 2. Provisioning code
 set "CODE="
-set /p CODE=Enter provisioning code: 
+set /p CODE=Provisioning code, or press Enter to keep the current one: 
 if "%CODE%"=="" goto emptycode
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup-kiosk.ps1" -BeUrl "%BE_URL%" -Code "%CODE%"
 if errorlevel 1 exit /b 1

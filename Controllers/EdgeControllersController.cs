@@ -33,19 +33,30 @@ public sealed class EdgeControllersController : ControllerBase
             return BadRequest(new { ok = false, error = "controller_id is required" });
 
         var code = (body.DeviceCode ?? body.ControllerId)!.Trim();
-        var reported = await ReportAsync(code, body, ct);
-        var state = reported?.EdgeState ?? "Pending";
-        _registry.Set(code, state);
+        var reported = await ReportAsync(code, body);
+        if (reported is null)
+        {
+            if (!_registry.IsAccepted(code) && !_registry.IsBlocked(code))
+                _registry.Set(code, "Pending");
+            return StatusCode(StatusCodes.Status201Created, new
+            {
+                ok = true,
+                controller_id = code,
+                status = _registry.IsAccepted(code) ? "Approved" : "Pending"
+            });
+        }
+
+        _registry.Set(code, reported.EdgeState);
         return StatusCode(StatusCodes.Status201Created, new
         {
             ok = true,
             controller_id = code,
-            status = state,
-            secret = reported?.Secret
+            status = reported.EdgeState,
+            secret = reported.Secret
         });
     }
 
-    private async Task<BeRegister?> ReportAsync(string code, RegisterBody body, CancellationToken ct)
+    private async Task<BeRegister?> ReportAsync(string code, RegisterBody body)
     {
         if (string.IsNullOrWhiteSpace(_options.KioskSecret) || string.IsNullOrWhiteSpace(_options.BackendUrl))
         {
@@ -56,6 +67,7 @@ public sealed class EdgeControllersController : ControllerBase
         try
         {
             var client = _http.CreateClient();
+            client.Timeout = TimeSpan.FromSeconds(8);
             using var request = new HttpRequestMessage(
                 HttpMethod.Post,
                 $"{_options.BackendUrl.TrimEnd('/')}/api/controllers/register")
@@ -70,14 +82,14 @@ public sealed class EdgeControllersController : ControllerBase
                 })
             };
             request.Headers.Add("X-Kiosk-Key", _options.KioskSecret);
-            using var response = await client.SendAsync(request, ct);
+            using var response = await client.SendAsync(request, CancellationToken.None);
             if (!response.IsSuccessStatusCode)
             {
                 _logger.LogWarning("BE register failed for {Code}: {Status}", code, response.StatusCode);
                 return null;
             }
 
-            var envelope = await response.Content.ReadFromJsonAsync<BeEnvelope>(ct);
+            var envelope = await response.Content.ReadFromJsonAsync<BeEnvelope>(CancellationToken.None);
             return envelope?.Data;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)

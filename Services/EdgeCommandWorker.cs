@@ -125,11 +125,18 @@ public sealed class EdgeCommandWorker : BackgroundService
             unit = string.IsNullOrWhiteSpace(reading.Unit) ? "state" : reading.Unit,
             measuredAt = snapshot.ReceivedAt,
             ipAddress = snapshot.IpAddress
-        });
+        }).ToList();
+
+        // meter_min and meter_c are new codes. The live API rejects an unknown
+        // code and fails the whole batch, so they go in a second post.
+        var extras = measurements
+            .Where(m => m.sensorCode is "meter_min" or "meter_c")
+            .ToList();
+        var main = measurements.Except(extras).ToList();
 
         using var response = await client.PostAsJsonAsync(
             $"{backend}/api/iot/sensor-data/batch",
-            new { measurements },
+            new { measurements = main },
             ct);
         if (!response.IsSuccessStatusCode)
         {
@@ -138,6 +145,18 @@ public sealed class EdgeCommandWorker : BackgroundService
                 snapshot.DeviceCode,
                 response.StatusCode);
             return;
+        }
+
+        if (extras.Count > 0)
+        {
+            using var extraResponse = await client.PostAsJsonAsync(
+                $"{backend}/api/iot/sensor-data/batch",
+                new { measurements = extras },
+                ct);
+            if (!extraResponse.IsSuccessStatusCode)
+                _logger.LogWarning(
+                    "BE has no sensor for meter runtime or temperature yet ({StatusCode})",
+                    extraResponse.StatusCode);
         }
 
         _lastForwarded[snapshot.DeviceCode] = DateTime.UtcNow;
