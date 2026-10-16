@@ -75,6 +75,8 @@ public sealed class EdgeCommandWorker : BackgroundService
                 _lastHeartbeat = DateTime.UtcNow;
         }
 
+        await SyncTelemetryAsync(backend, ct);
+
         foreach (var snapshot in _telemetry.GetAll())
         {
             if (string.IsNullOrWhiteSpace(snapshot.IpAddress))
@@ -120,6 +122,10 @@ public sealed class EdgeCommandWorker : BackgroundService
             }
         }
 
+    }
+
+    private async Task SyncTelemetryAsync(string backend, CancellationToken ct)
+    {
         foreach (var item in await _outbox.PendingAsync(100, ct))
         {
             try
