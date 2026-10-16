@@ -136,6 +136,10 @@ public sealed class EdgeCommandWorker : BackgroundService
         var pending = await _outbox.PendingAsync(100, ct);
         if (pending.Count == 0)
             return;
+        _logger.LogInformation(
+            "Telemetry sync: {SnapshotCount} snapshot(s), {ReadingCount} reading(s), pending queue active",
+            pending.Count,
+            pending.Sum(item => item.Snapshot.Readings.Count));
 
         var measurements = pending
             .SelectMany(item => item.Snapshot.Readings.Select(reading => new
@@ -183,6 +187,9 @@ public sealed class EdgeCommandWorker : BackgroundService
 
         foreach (var item in pending)
             await _outbox.RemoveAsync(item.Id, ct);
+        _logger.LogInformation(
+            "Telemetry batch accepted by BE; removed {SnapshotCount} snapshot(s) from local queue",
+            pending.Count);
     }
 
     private async Task<bool> ForwardTelemetryAsync(
