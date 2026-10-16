@@ -56,6 +56,7 @@ jobs:
           if [ -n "$previous" ] && [ -f "$previous/kiosk-secret.txt" ]; then
             sudo cp "$previous/kiosk-secret.txt" "$release/kiosk-secret.txt"
           fi
+          sudo chmod +x "$release/CrabSenseKiosk"
           sudo chown -R korokoro:korokoro "$release"
           sudo ln -sfn "$release" /opt/crabsense-kiosk/current
           sudo systemctl restart crabsense-kiosk
