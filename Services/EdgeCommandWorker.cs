@@ -41,6 +41,15 @@ public sealed class EdgeCommandWorker : BackgroundService
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogWarning("Edge poll skipped: {Message}", ex.Message);
+                try
+                {
+                    var backend = _options.BackendUrl.Trim().TrimEnd('/');
+                    await SyncTelemetryAsync(backend, stoppingToken);
+                }
+                catch (Exception syncEx) when (syncEx is not OperationCanceledException)
+                {
+                    _logger.LogWarning("Offline telemetry retry skipped: {Message}", syncEx.Message);
+                }
             }
 
             await Task.Delay(
