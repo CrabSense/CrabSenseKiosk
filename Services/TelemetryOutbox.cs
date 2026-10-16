@@ -58,7 +58,7 @@ public sealed class TelemetryOutbox
             while (await rows.ReadAsync(ct))
             {
                 var snapshot = JsonSerializer.Deserialize<TelemetrySnapshot>(
-                    rows.GetString(1));
+                    rows.GetString(2));
                 if (snapshot is not null)
                     result.Add((rows.GetInt64(0), rows.GetString(1), snapshot));
             }
