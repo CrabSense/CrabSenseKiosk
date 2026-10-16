@@ -56,7 +56,7 @@ jobs:
           sudo chown -R korokoro:korokoro "$release"
           sudo ln -sfn "$release" /opt/crabsense-kiosk/current
           sudo systemctl restart crabsense-kiosk
-          if ! curl --fail --silent --show-error --retry 10 --retry-delay 2 http://127.0.0.1:8090/api/health; then
+          if ! python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/api/health', timeout=8)"; then
             if [ -n "$previous" ]; then
               sudo ln -sfn "$previous" /opt/crabsense-kiosk/current
               sudo systemctl restart crabsense-kiosk
