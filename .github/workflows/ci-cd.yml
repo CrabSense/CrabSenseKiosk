@@ -2,9 +2,9 @@ name: CrabSense Kiosk CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: [main, DEV-Duy]
   pull_request:
-    branches: [main]
+    branches: [main, DEV-Duy]
   workflow_dispatch:
 
 concurrency:
