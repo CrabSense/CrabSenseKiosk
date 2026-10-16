@@ -53,10 +53,24 @@ jobs:
           previous="$(readlink -f /opt/crabsense-kiosk/current 2>/dev/null || true)"
           sudo mkdir -p "$release"
           sudo cp -a publish/. "$release/"
+          if [ -n "$previous" ] && [ -f "$previous/kiosk-secret.txt" ]; then
+            sudo cp "$previous/kiosk-secret.txt" "$release/kiosk-secret.txt"
+          fi
           sudo chown -R korokoro:korokoro "$release"
           sudo ln -sfn "$release" /opt/crabsense-kiosk/current
           sudo systemctl restart crabsense-kiosk
-          if ! python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/api/health', timeout=8)"; then
+          if ! python3 - <<'PY'
+          import time
+          import urllib.request
+          for _ in range(10):
+              try:
+                  urllib.request.urlopen('http://127.0.0.1:8090/api/health', timeout=8)
+                  break
+              except Exception:
+                  time.sleep(2)
+          else:
+              raise SystemExit(1)
+          PY
             if [ -n "$previous" ]; then
               sudo ln -sfn "$previous" /opt/crabsense-kiosk/current
               sudo systemctl restart crabsense-kiosk
