@@ -12,6 +12,7 @@ public sealed class EdgeCommandWorker : BackgroundService
     private readonly ILogger<EdgeCommandWorker> _logger;
     private readonly IControllerRegistry _controllers;
     private readonly TelemetryOutbox _outbox;
+    private DateTime _lastHeartbeat = DateTime.MinValue;
 
     public EdgeCommandWorker(
         ITelemetryService telemetry,
@@ -56,6 +57,21 @@ public sealed class EdgeCommandWorker : BackgroundService
         {
             _logger.LogWarning("Skipping backend because the URL is invalid: {Backend}", backend);
             return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_options.KioskSecret)
+            && DateTime.UtcNow - _lastHeartbeat >= TimeSpan.FromSeconds(15))
+        {
+            using var heartbeat = new HttpRequestMessage(
+                HttpMethod.Post,
+                $"{backend}/api/kiosks/heartbeat")
+            {
+                Content = JsonContent.Create(new { lanIp = (string?)null })
+            };
+            heartbeat.Headers.Add("X-Kiosk-Key", _options.KioskSecret);
+            using var response = await _httpClients.CreateClient().SendAsync(heartbeat, ct);
+            if (response.IsSuccessStatusCode)
+                _lastHeartbeat = DateTime.UtcNow;
         }
 
         foreach (var snapshot in _telemetry.GetAll())
