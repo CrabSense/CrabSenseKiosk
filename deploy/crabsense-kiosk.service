@@ -1,0 +1,16 @@
+[Unit]
+Description=CrabSense Kiosk edge gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/crabsense-kiosk/current
+ExecStart=/opt/crabsense-kiosk/current/CrabSenseKiosk
+Environment=ASPNETCORE_URLS=http://0.0.0.0:8090
+Environment=ASPNETCORE_ENVIRONMENT=Production
+Restart=on-failure
+RestartSec=3
+User=korokoro
+
+[Install]
+WantedBy=multi-user.target

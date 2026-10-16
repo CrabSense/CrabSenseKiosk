@@ -50,9 +50,14 @@ try
         });
     });
 
-    // Configure Database
-    builder.Services.AddDbContext<ApplicationDbContext>(options =>
-        options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+    // The edge gateway does not need the legacy SQL Server store. Keep the
+    // registration opt-in so Linux deployments do not try to reach LocalDB.
+    var useLocalDatabase = builder.Configuration.GetValue<bool>("Kiosk:UseLocalDatabase");
+    if (useLocalDatabase)
+    {
+        builder.Services.AddDbContext<ApplicationDbContext>(options =>
+            options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+    }
 
     // Configure CORS
     builder.Services.AddCors(options =>
@@ -99,18 +104,21 @@ try
 
     app.MapControllers();
 
-    // Initialize database
-    using (var scope = app.Services.CreateScope())
+    // Initialize the optional local database only when explicitly enabled.
+    if (useLocalDatabase)
     {
-        var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-        try
+        using (var scope = app.Services.CreateScope())
         {
-            context.Database.Migrate();
-            Log.Information("Database migration completed successfully");
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "An error occurred while migrating the database");
+            var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            try
+            {
+                context.Database.Migrate();
+                Log.Information("Database migration completed successfully");
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "An error occurred while migrating the database");
+            }
         }
     }
 
