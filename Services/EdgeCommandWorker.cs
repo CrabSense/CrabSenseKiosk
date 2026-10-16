@@ -107,7 +107,7 @@ public sealed class EdgeCommandWorker : BackgroundService
             try
             {
                 var client = _httpClients.CreateClient();
-                if (await ForwardTelemetryAsync(item.Snapshot, backend, client, ct))
+                if (await ForwardTelemetryAsync(item.EventId, item.Snapshot, backend, client, ct))
                     await _outbox.RemoveAsync(item.Id, ct);
             }
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
@@ -119,6 +119,7 @@ public sealed class EdgeCommandWorker : BackgroundService
     }
 
     private async Task<bool> ForwardTelemetryAsync(
+        string eventId,
         DTOs.TelemetrySnapshot snapshot,
         string backend,
         HttpClient client,
@@ -133,7 +134,8 @@ public sealed class EdgeCommandWorker : BackgroundService
             value = reading.Value,
             unit = string.IsNullOrWhiteSpace(reading.Unit) ? "state" : reading.Unit,
             measuredAt = snapshot.ReceivedAt,
-            ipAddress = snapshot.IpAddress
+            ipAddress = snapshot.IpAddress,
+            eventId
         }).ToList();
 
         // meter_min and meter_c are new codes. The live API rejects an unknown

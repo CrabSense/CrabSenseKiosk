@@ -27,9 +27,11 @@ public sealed class TelemetryOutbox
             await using var db = Open();
             await using var cmd = db.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO telemetry_outbox(device_code, payload, created_at)
-                VALUES ($device, $payload, $created);
+                INSERT INTO telemetry_outbox(event_id, device_code, payload, created_at)
+                VALUES ($event, $device, $payload, $created);
                 """;
+            var eventId = Guid.NewGuid().ToString("N");
+            cmd.Parameters.AddWithValue("$event", eventId);
             cmd.Parameters.AddWithValue("$device", snapshot.DeviceCode);
             cmd.Parameters.AddWithValue("$payload", JsonSerializer.Serialize(snapshot));
             cmd.Parameters.AddWithValue("$created", snapshot.ReceivedAt.ToString("O"));
@@ -38,7 +40,7 @@ public sealed class TelemetryOutbox
         finally { _gate.Release(); }
     }
 
-    public async Task<IReadOnlyList<(long Id, TelemetrySnapshot Snapshot)>> PendingAsync(
+    public async Task<IReadOnlyList<(long Id, string EventId, TelemetrySnapshot Snapshot)>> PendingAsync(
         int take, CancellationToken ct = default)
     {
         await _gate.WaitAsync(ct);
@@ -47,18 +49,18 @@ public sealed class TelemetryOutbox
             await using var db = Open();
             await using var cmd = db.CreateCommand();
             cmd.CommandText = """
-                SELECT id, payload FROM telemetry_outbox
+                SELECT id, event_id, payload FROM telemetry_outbox
                 ORDER BY id LIMIT $take;
                 """;
             cmd.Parameters.AddWithValue("$take", take);
             await using var rows = await cmd.ExecuteReaderAsync(ct);
-            var result = new List<(long, TelemetrySnapshot)>();
+            var result = new List<(long, string, TelemetrySnapshot)>();
             while (await rows.ReadAsync(ct))
             {
                 var snapshot = JsonSerializer.Deserialize<TelemetrySnapshot>(
                     rows.GetString(1));
                 if (snapshot is not null)
-                    result.Add((rows.GetInt64(0), snapshot));
+                    result.Add((rows.GetInt64(0), rows.GetString(1), snapshot));
             }
             return result;
         }
@@ -95,6 +97,7 @@ public sealed class TelemetryOutbox
             PRAGMA synchronous = FULL;
             CREATE TABLE IF NOT EXISTS telemetry_outbox(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
                 device_code TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -103,5 +106,15 @@ public sealed class TelemetryOutbox
                 ON telemetry_outbox(id);
             """;
         cmd.ExecuteNonQuery();
+        try
+        {
+            using var alter = db.CreateCommand();
+            alter.CommandText = "ALTER TABLE telemetry_outbox ADD COLUMN event_id TEXT;";
+            alter.ExecuteNonQuery();
+        }
+        catch (SqliteException)
+        {
+            // Existing installations already have the current schema.
+        }
     }
 }
