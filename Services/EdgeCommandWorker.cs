@@ -1,5 +1,4 @@
 using System.Net.Http.Json;
-using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 
@@ -112,8 +111,7 @@ public sealed class EdgeCommandWorker : BackgroundService
                 foreach (var command in envelope?.Data ?? [])
                     await ForwardAsync(snapshot, command, backend, ct);
             }
-            catch (Exception ex) when (
-                ex is HttpRequestException or TaskCanceledException or JsonException)
+            catch (Exception ex)
             {
                 _logger.LogWarning(
                     "Edge command poll unavailable for {DeviceCode}: {Message}",
