@@ -133,20 +133,56 @@ public sealed class EdgeCommandWorker : BackgroundService
 
     private async Task SyncTelemetryAsync(string backend, CancellationToken ct)
     {
-        foreach (var item in await _outbox.PendingAsync(100, ct))
+        var pending = await _outbox.PendingAsync(100, ct);
+        if (pending.Count == 0)
+            return;
+
+        var measurements = pending
+            .SelectMany(item => item.Snapshot.Readings.Select(reading => new
+            {
+                deviceCode = item.Snapshot.DeviceCode,
+                sensorCode = string.IsNullOrWhiteSpace(reading.SensorCode)
+                    ? $"float_{reading.Pin}"
+                    : reading.SensorCode,
+                value = reading.Value,
+                unit = string.IsNullOrWhiteSpace(reading.Unit) ? "state" : reading.Unit,
+                measuredAt = item.Snapshot.ReceivedAt,
+                ipAddress = item.Snapshot.IpAddress,
+                eventId = item.EventId
+            }))
+            .ToList();
+
+        var extras = measurements
+            .Where(m => m.sensorCode is "meter_min" or "meter_c")
+            .ToList();
+        var main = measurements.Except(extras).ToList();
+        var client = _httpClients.CreateClient();
+
+        using var response = await client.PostAsJsonAsync(
+            $"{backend}/api/iot/sensor-data/batch",
+            new { measurements = main },
+            ct);
+        if (!response.IsSuccessStatusCode)
         {
-            try
+            _logger.LogWarning("Offline telemetry batch failed: {StatusCode}", response.StatusCode);
+            return;
+        }
+
+        if (extras.Count > 0)
+        {
+            using var extraResponse = await client.PostAsJsonAsync(
+                $"{backend}/api/iot/sensor-data/batch",
+                new { measurements = extras },
+                ct);
+            if (!extraResponse.IsSuccessStatusCode)
             {
-                var client = _httpClients.CreateClient();
-                if (await ForwardTelemetryAsync(item.EventId, item.Snapshot, backend, client, ct))
-                    await _outbox.RemoveAsync(item.Id, ct);
-            }
-            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
-            {
-                _logger.LogWarning("Offline telemetry sync unavailable: {Message}", ex.Message);
-                break;
+                _logger.LogWarning("Offline meter batch failed: {StatusCode}", extraResponse.StatusCode);
+                return;
             }
         }
+
+        foreach (var item in pending)
+            await _outbox.RemoveAsync(item.Id, ct);
     }
 
     private async Task<bool> ForwardTelemetryAsync(
