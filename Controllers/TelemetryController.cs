@@ -9,15 +9,18 @@ public sealed class TelemetryController : ControllerBase
 {
     private readonly ITelemetryService _telemetry;
     private readonly IControllerRegistry _controllers;
+    private readonly TelemetryOutbox _outbox;
     private readonly ILogger<TelemetryController> _logger;
 
     public TelemetryController(
         ITelemetryService telemetry,
         IControllerRegistry controllers,
+        TelemetryOutbox outbox,
         ILogger<TelemetryController> logger)
     {
         _telemetry = telemetry;
         _controllers = controllers;
+        _outbox = outbox;
         _logger = logger;
     }
 
@@ -51,6 +54,7 @@ public sealed class TelemetryController : ControllerBase
         }
 
         var snapshot = _telemetry.Store(payload);
+        _outbox.EnqueueAsync(snapshot).GetAwaiter().GetResult();
         _logger.LogInformation(
             "Received {ReadingCount} readings from ESP32 {Mac}",
             snapshot.Readings.Count,

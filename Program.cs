@@ -76,6 +76,7 @@ try
     builder.Services.AddScoped<ISensorService, SensorService>();
     builder.Services.AddScoped<IAlertService, AlertService>();
     builder.Services.AddSingleton<ITelemetryService, TelemetryService>();
+    builder.Services.AddSingleton<TelemetryOutbox>();
     builder.Services.AddSingleton<IControllerRegistry, ControllerRegistry>();
     builder.Services.AddHostedService<EdgeCommandWorker>();
 

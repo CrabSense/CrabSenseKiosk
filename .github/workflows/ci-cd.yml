@@ -51,6 +51,8 @@ jobs:
           set -euo pipefail
           release="/opt/crabsense-kiosk/releases/${GITHUB_SHA}"
           previous="$(readlink -f /opt/crabsense-kiosk/current 2>/dev/null || true)"
+          sudo mkdir -p /var/lib/crabsense-kiosk
+          sudo chown -R korokoro:korokoro /var/lib/crabsense-kiosk
           sudo mkdir -p "$release"
           sudo cp -a publish/. "$release/"
           if [ -n "$previous" ] && [ -f "$previous/kiosk-secret.txt" ]; then

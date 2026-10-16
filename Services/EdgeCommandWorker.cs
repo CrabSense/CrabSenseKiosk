@@ -10,22 +10,22 @@ public sealed class EdgeCommandWorker : BackgroundService
     private readonly IHttpClientFactory _httpClients;
     private readonly EdgeGatewayOptions _options;
     private readonly ILogger<EdgeCommandWorker> _logger;
-    private readonly Dictionary<string, DateTime> _lastForwarded = new(
-        StringComparer.OrdinalIgnoreCase);
-
     private readonly IControllerRegistry _controllers;
+    private readonly TelemetryOutbox _outbox;
 
     public EdgeCommandWorker(
         ITelemetryService telemetry,
         IHttpClientFactory httpClients,
         IOptions<EdgeGatewayOptions> options,
         IControllerRegistry controllers,
+        TelemetryOutbox outbox,
         ILogger<EdgeCommandWorker> logger)
     {
         _telemetry = telemetry;
         _httpClients = httpClients;
         _options = options.Value;
         _controllers = controllers;
+        _outbox = outbox;
         _logger = logger;
     }
 
@@ -73,7 +73,6 @@ public sealed class EdgeCommandWorker : BackgroundService
             try
             {
                 var client = _httpClients.CreateClient();
-                await ForwardTelemetryAsync(snapshot, backend, client, ct);
                 using var request = new HttpRequestMessage(
                     HttpMethod.Get,
                     $"{backend}/api/edge/commands/pending" +
@@ -102,19 +101,29 @@ public sealed class EdgeCommandWorker : BackgroundService
                     ex.Message);
             }
         }
+
+        foreach (var item in await _outbox.PendingAsync(100, ct))
+        {
+            try
+            {
+                var client = _httpClients.CreateClient();
+                if (await ForwardTelemetryAsync(item.Snapshot, backend, client, ct))
+                    await _outbox.RemoveAsync(item.Id, ct);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                _logger.LogWarning("Offline telemetry sync unavailable: {Message}", ex.Message);
+                break;
+            }
+        }
     }
 
-    private async Task ForwardTelemetryAsync(
+    private async Task<bool> ForwardTelemetryAsync(
         DTOs.TelemetrySnapshot snapshot,
         string backend,
         HttpClient client,
         CancellationToken ct)
     {
-        if (_lastForwarded.TryGetValue(snapshot.DeviceCode, out var last)
-            && DateTime.UtcNow - last
-                < TimeSpan.FromSeconds(_options.TelemetryForwardIntervalSeconds))
-            return;
-
         var measurements = snapshot.Readings.Select(reading => new
         {
             deviceCode = snapshot.DeviceCode,
@@ -144,7 +153,7 @@ public sealed class EdgeCommandWorker : BackgroundService
                 "BE telemetry forward failed for {DeviceCode}: {StatusCode}",
                 snapshot.DeviceCode,
                 response.StatusCode);
-            return;
+            return false;
         }
 
         if (extras.Count > 0)
@@ -154,12 +163,15 @@ public sealed class EdgeCommandWorker : BackgroundService
                 new { measurements = extras },
                 ct);
             if (!extraResponse.IsSuccessStatusCode)
+            {
                 _logger.LogWarning(
                     "BE has no sensor for meter runtime or temperature yet ({StatusCode})",
                     extraResponse.StatusCode);
+                return false;
+            }
         }
 
-        _lastForwarded[snapshot.DeviceCode] = DateTime.UtcNow;
+        return true;
     }
 
     private async Task ForwardAsync(
