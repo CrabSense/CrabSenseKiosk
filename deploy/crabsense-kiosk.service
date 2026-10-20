@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 WorkingDirectory=/opt/crabsense-kiosk/current
 ExecStart=/opt/crabsense-kiosk/current/CrabSenseKiosk
+EnvironmentFile=-/etc/crabsense-kiosk.env
 Environment=ASPNETCORE_URLS=http://0.0.0.0:8090
 Environment=ASPNETCORE_ENVIRONMENT=Production
 Restart=on-failure
