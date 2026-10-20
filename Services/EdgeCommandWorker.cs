@@ -162,10 +162,8 @@ public sealed class EdgeCommandWorker : BackgroundService
         var main = measurements.Except(extras).ToList();
         var client = _httpClients.CreateClient();
 
-        using var response = await client.PostAsJsonAsync(
-            $"{backend}/api/iot/sensor-data/batch",
-            new { measurements = main },
-            ct);
+        using var response = await PostTelemetryAsync(
+            client, $"{backend}/api/iot/sensor-data/batch", new { measurements = main }, ct);
         if (!response.IsSuccessStatusCode)
         {
             _logger.LogWarning("Offline telemetry batch failed: {StatusCode}", response.StatusCode);
@@ -174,10 +172,8 @@ public sealed class EdgeCommandWorker : BackgroundService
 
         if (extras.Count > 0)
         {
-            using var extraResponse = await client.PostAsJsonAsync(
-                $"{backend}/api/iot/sensor-data/batch",
-                new { measurements = extras },
-                ct);
+            using var extraResponse = await PostTelemetryAsync(
+                client, $"{backend}/api/iot/sensor-data/batch", new { measurements = extras }, ct);
             if (!extraResponse.IsSuccessStatusCode)
             {
                 _logger.LogWarning("Offline meter batch failed: {StatusCode}", extraResponse.StatusCode);
@@ -219,10 +215,8 @@ public sealed class EdgeCommandWorker : BackgroundService
             .ToList();
         var main = measurements.Except(extras).ToList();
 
-        using var response = await client.PostAsJsonAsync(
-            $"{backend}/api/iot/sensor-data/batch",
-            new { measurements = main },
-            ct);
+        using var response = await PostTelemetryAsync(
+            client, $"{backend}/api/iot/sensor-data/batch", new { measurements = main }, ct);
         if (!response.IsSuccessStatusCode)
         {
             _logger.LogWarning(
@@ -234,10 +228,8 @@ public sealed class EdgeCommandWorker : BackgroundService
 
         if (extras.Count > 0)
         {
-            using var extraResponse = await client.PostAsJsonAsync(
-                $"{backend}/api/iot/sensor-data/batch",
-                new { measurements = extras },
-                ct);
+            using var extraResponse = await PostTelemetryAsync(
+                client, $"{backend}/api/iot/sensor-data/batch", new { measurements = extras }, ct);
             if (!extraResponse.IsSuccessStatusCode)
             {
                 _logger.LogWarning(
@@ -248,6 +240,21 @@ public sealed class EdgeCommandWorker : BackgroundService
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// POST telemetry kèm X-Edge-Key — BE đóng endpoint nếu thiếu/sai key.
+    /// </summary>
+    private async Task<HttpResponseMessage> PostTelemetryAsync(
+        HttpClient client, string url, object payload, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = JsonContent.Create(payload)
+        };
+        if (!string.IsNullOrWhiteSpace(_options.ApiKey))
+            request.Headers.Add("X-Edge-Key", _options.ApiKey);
+        return await client.SendAsync(request, ct);
     }
 
     private async Task ForwardAsync(
