@@ -4,7 +4,7 @@ public sealed class EdgeGatewayOptions
 {
     public const string SectionName = "EdgeGateway";
 
-    public string BackendUrl { get; set; } = "http://localhost:5080";
+    public string BackendUrl { get; set; } = string.Empty;
     /// <summary>X-Edge-Key — phải cấu hình qua env (EdgeGateway__ApiKey), không mặc định trong code.</summary>
     public string ApiKey { get; set; } = string.Empty;
     public string? KioskSecret { get; set; }
