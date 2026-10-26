@@ -178,6 +178,79 @@ SCALE = {
     ("UPS.Output", "DelayBeforeStartup"): (1, "s", ""),
 }
 
+# =====================================================================
+# Cong suat SUY RA — may KHONG do W/A tren duong USB.
+#
+# Da quet toan bo 0x00..0x60 (ke ca report khong khai bao) va doi chieu log
+# NUT cua OLS1000E cung dong: khong ton tai usage 0x31 (Current),
+# 0x33 (ApparentPower), 0x34 (ActivePower), 0x32 (Frequency) o bat ky report
+# nao. LCD hien W/A vi no doc truc tiep tu DSP, khong qua HID.
+#
+# Nen moi so duoi day deu co dau ~ va co cong thuc goc:
+#   real_nom = report 0x18  (1350 W — may tu khai)
+#   pf_out   = real_nom / VA_nominal  (1350/1500 = 0.9, khop datasheet)
+#   out_W    = load% x real_nom / 100
+#   out_VA   = out_W / pf_out
+#   out_A    = out_VA / output.voltage
+#   in_W     = out_W / hieu_suat   (chi khi co dien luoi, mat dien -> 0)
+#   in_A     = (in_W / pf_in) / input.voltage
+# =====================================================================
+DEFAULT_OUTPUT_PF = 0.9    # datasheet: Power Factor 0.9 (1350/1500)
+DEFAULT_INPUT_PF = 0.98    # datasheet: Input Power Factor 0.98
+DEFAULT_EFFICIENCY = 0.90  # online double conversion; ECO >0.95
+
+
+def va_nominal(model: str, real_nom) -> float | None:
+    """Lay VA dinh muc: uu tien so trong ten model (OLS1500... = 1500 VA),
+    fallback real_nom / pf_out."""
+    import re
+    m = re.search(r"(\d{3,5})", model or "")
+    if m and int(m.group(1)) >= 500:
+        return float(m.group(1))
+    if real_nom:
+        return float(real_nom) / DEFAULT_OUTPUT_PF
+    return None
+
+
+def derive_power(nut: dict, va_nom, out_pf=DEFAULT_OUTPUT_PF,
+                 in_pf=DEFAULT_INPUT_PF, ef=DEFAULT_EFFICIENCY) -> dict:
+    """Suy ra W/VA/A. Tra ve dict rong neu thieu du lieu goc."""
+    load = nut.get("ups.load")
+    real_nom = nut.get("ups.realpower.nominal")
+    out_v = nut.get("output.voltage")
+    in_v = nut.get("input.voltage")
+    if load is None or not real_nom:
+        return {}
+
+    out_w = load / 100.0 * float(real_nom)
+    res = {"output.realpower_est": out_w,
+           "output.power_est": out_w / out_pf}
+    if out_v:
+        res["output.current_est"] = res["output.power_est"] / float(out_v)
+
+    # Mat dien luoi => dau vao = 0 W that su, khong phai uoc luong.
+    if in_v:
+        in_w = out_w / ef
+        res["input.realpower_est"] = in_w
+        res["input.power_est"] = in_w / in_pf
+        res["input.current_est"] = res["input.power_est"] / float(in_v)
+    elif in_v == 0:
+        res["input.realpower_est"] = 0.0
+        res["input.power_est"] = 0.0
+        res["input.current_est"] = 0.0
+
+    res["_basis"] = {
+        "load_pct": load,
+        "output.realpower.nominal_measured": real_nom,
+        "va_nominal": va_nom,
+        "output_pf": out_pf,
+        "input_pf": in_pf,
+        "efficiency": ef,
+        "estimated": True,
+        "note": "may khong do W/A tren USB; suy ra tu load% x cong suat dinh muc",
+    }
+    return res
+
 ENUMS = {
     ("UPS.Output", "Test"): {0: "no test", 1: "quick test", 2: "deep test", 3: "abort", 4: "passed", 5: "failed"},
     ("UPS.PowerSummary", "AudibleAlarmControl"): {1: "disabled", 2: "enabled", 3: "muted"},
@@ -415,7 +488,7 @@ def print_report(reports, verbose=True, show_nut=False):
     return {"raw": data, "nut": nuts}
 
 
-def print_summary(nut):
+def print_summary(nut, est=None):
     def g(name, default=None):
         return nut.get(name, default)
 
@@ -444,6 +517,72 @@ def print_summary(nut):
     for flag in ("ups.status:CHRG", "ups.status:OB|DISCHRG", "ups.status:LB"):
         if flag in nut:
             print(f"  {flag:<19}: {nut[flag]}")
+
+    if est:
+        b = est["_basis"]
+        print("\n--- CONG SUAT SUY RA (~ = uoc luong, may KHONG do W/A tren USB) ---")
+        print(f"  output  W  ~ {est['output.realpower_est']:8.1f}")
+        print(f"          VA ~ {est['output.power_est']:8.1f}")
+        if "output.current_est" in est:
+            print(f"          A  ~ {est['output.current_est']:8.2f}")
+        print(f"  input   W  ~ {est['input.realpower_est']:8.1f}"
+              + ("   (mat dien luoi -> 0 that)" if not in_v else ""))
+        print(f"          VA ~ {est['input.power_est']:8.1f}")
+        if "input.current_est" in est:
+            print(f"          A  ~ {est['input.current_est']:8.2f}")
+        print(f"  goc: load {b['load_pct']}% x {b['output.realpower.nominal_measured']} W"
+              f" | VA {b['va_nominal']:.0f} | PF {b['output_pf']}"
+              f" | hieu suat {b['efficiency']} | PF vao {b['input_pf']}")
+        print(f"  do phan giai: 1% load = {b['output.realpower.nominal_measured'] / 100:.1f} W")
+
+
+def print_fields(fields_by_kind, model, mfr, serial):
+    """Liet ke moi du lieu lay duoc: doc tu may (M) / tinh (T) / khong co."""
+    print(f"UPS: {mfr} / {model} / serial={serial}\n")
+    print(f"{'report':>7}  {'duong dan / y nghia':<48} {'bien NUT':<34} nguon")
+    print("-" * 118)
+
+    seen_nut = set()
+    for rid in sorted(fields_by_kind["feature"]):
+        for f in fields_by_kind["feature"][rid]:
+            nut = f.nut()
+            nutname = nut[0] if nut else "-"
+            if nut:
+                seen_nut.add(nut[0])
+            extra = ""
+            if f.count > 1:
+                extra = f"  x{f.count}"
+            # string index: doc duoc so, nhung khong doi ra chuoi duoc tren Windows
+            src = "I" if (nut and len(nut) > 1 and nut[1] == "stringidx") else "M"
+            print(f"  0x{rid:02x}   {f.full_path + extra:<48} {nutname:<34} {src}")
+    print("-" * 118)
+    print("M = doc truc tiep tu UPS qua HID feature report (so do that)")
+    print("I = chi la chi so (index) cua string descriptor; Windows khong doc duoc chuoi")
+
+    # Du lieu suy ra
+    print("\nSUY RA (may khong do tren USB):")
+    for label, formula in (
+        ("output.realpower_est  (W)", "load% x ConfigActivePower(0x18) / 100"),
+        ("output.power_est      (VA)", "output W / PF 0.9"),
+        ("output.current_est    (A)", "output VA / output.voltage(0x12)"),
+        ("input.realpower_est   (W)", "output W / hieu suat (0 khi mat dien)"),
+        ("input.power_est       (VA)", "input W / PF vao 0.98"),
+        ("input.current_est     (A)", "input VA / input.voltage(0x0f)"),
+    ):
+        print(f"  {label:<30} = {formula}")
+
+    # Khong co
+    print("\nKHONG CO TREN THIET BI NAY (da quet 0x00-0x60):")
+    for label, why in (
+        ("Current (A) usage 0x31", "khong khai bao trong descriptor"),
+        ("ApparentPower (VA) usage 0x33", "khong khai bao trong descriptor"),
+        ("ActivePower (W) usage 0x34", "khong khai bao trong descriptor"),
+        ("Frequency (Hz) usage 0x32", "khong khai bao trong descriptor"),
+        ("ups.firmware (0xff0100d0)", "firmware CPS khong co field nay"),
+        ("ups.serial / ups.mfr", "chi co string index, HID Windows khong doc duoc"),
+        ("khoi vendor 0xff01 (0x25-0x2d)", "doc ra 0, chua ai decode cong khai"),
+    ):
+        print(f"  {label:<32} {why}")
 
 
 def run_selftest():
@@ -516,8 +655,30 @@ def run_selftest():
     # 6. NUT mapping
     check("nut battery.voltage", fv.nut()[0], "battery.voltage")
 
+    # 7. VA dinh muc: lay tu ten model, fallback tu real_nom / pf
+    check("VA tu model", va_nominal("OLS1500ERT2U", 1350), 1500.0)
+    check("VA fallback", va_nominal("khong-co-so", 1350), 1500.0)
+
+    # 8. Suy ra cong suat — load 20%, nominal 1350 W, 230 V, co dien luoi
+    nut = {"ups.load": 20, "ups.realpower.nominal": 1350,
+           "output.voltage": 230, "input.voltage": 230}
+    est = derive_power(nut, 1500)
+    check("out W", round(est["output.realpower_est"], 4), 270.0)
+    check("out VA", round(est["output.power_est"], 4), 300.0)
+    check("out A", round(est["output.current_est"], 4), round(300 / 230, 4))
+    check("in W", round(est["input.realpower_est"], 4), round(270 / 0.9, 4))
+
+    # 9. Mat dien luoi -> dau vao = 0 (su that vat ly, khong phai uoc luong)
+    nut["input.voltage"] = 0
+    est0 = derive_power(nut, 1500)
+    check("in W khi mat dien", est0["input.realpower_est"], 0.0)
+    check("out W khi mat dien", round(est0["output.realpower_est"], 4), 270.0)
+
+    # 10. Thieu du lieu goc -> khong bia so
+    check("thieu load -> rong", derive_power({"output.voltage": 230}, 1500), {})
+
     if fails == 0:
-        print("SELFTEST OK (13 kiem tra)")
+        print("SELFTEST OK (22 kiem tra)")
         return 0
     print(f"SELFTEST FAIL ({fails} loi)")
     return 1
@@ -531,6 +692,14 @@ def main(argv=None):
     ap.add_argument("--interval", type=float, default=5.0)
     ap.add_argument("--quiet", action="store_true", help="chi bang tom tat")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--fields", action="store_true",
+                    help="liet ke moi du lieu lay duoc roi thoat")
+    ap.add_argument("--pf-out", type=float, default=DEFAULT_OUTPUT_PF,
+                    help="he so cong suat dau ra (datasheet 0.9)")
+    ap.add_argument("--pf-in", type=float, default=DEFAULT_INPUT_PF,
+                    help="he so cong suat dau vao (datasheet 0.98)")
+    ap.add_argument("--eff", type=float, default=DEFAULT_EFFICIENCY,
+                    help="hieu suat online (0.90; ECO >0.95)")
     args = ap.parse_args(argv)
 
     if args.selftest:
@@ -567,6 +736,11 @@ def main(argv=None):
     lens = report_lengths(fields_by_kind)
     verbose = not args.quiet and not args.json
 
+    if args.fields:
+        print_fields(fields_by_kind, model, mfr, serial)
+        dev.close()
+        return 0
+
     if verbose:
         print(f"UPS: {mfr} / {model} / serial={serial}")
         print(f"     feature report: {len(fields_by_kind['feature'])}"
@@ -581,6 +755,10 @@ def main(argv=None):
         while True:
             reports = read_all(dev, fields_by_kind, lens)
             result = print_report(reports, verbose=verbose, show_nut=args.nut)
+            va_nom = va_nominal(model, result["nut"].get("ups.realpower.nominal"))
+            est = derive_power(result["nut"], va_nom,
+                               out_pf=args.pf_out, in_pf=args.pf_in,
+                               ef=args.eff)
             if args.json:
                 print(json.dumps({
                     "ts": datetime.now().astimezone().isoformat(),
@@ -589,9 +767,10 @@ def main(argv=None):
                     "serial": serial,
                     "source": "hid-descriptor+nut",
                     **result,
+                    "estimated": est or None,
                 }, ensure_ascii=False, default=str), flush=True)
             else:
-                print_summary(result["nut"])
+                print_summary(result["nut"], est)
             if args.once:
                 return 0
             time.sleep(args.interval)
