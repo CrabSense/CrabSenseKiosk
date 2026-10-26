@@ -76,3 +76,5 @@ appsettings.Production.json
 be-url.txt
 kiosk-secret.txt
 kiosk-identity.txt
+
+tools/__pycache__/

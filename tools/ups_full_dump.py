@@ -1,183 +1,244 @@
 #!/usr/bin/env python3
 """
-ups_full_dump.py — in RA TAT CA thong tin doc duoc tu UPS CyberPower, lien tuc.
+ups_full_dump.py — in RA MOI thong tin doc duoc tu UPS CyberPower, lien tuc.
 
-Khac ups_monitor.py: script nay khong dung danh sach truong cung, ma tu parse
-HID report descriptor cua firmware -> biet chinh xac tung report id co bao nhieu
-field, kich thuoc bit, usage page/usage, logical min/max, unit/exponent.
-Nho vay no in duoc ca nhung field la (vendor-specific) ma hang khong cong bo.
+Nguon doi chieu (open source):
+  * NUT drivers/cps-hid.c      - bang HID2NUT rieng cho CyberPower
+  * NUT drivers/libhid.c       - bang ten usage
+  * USB HID Usage Tables for HID Power Devices v1.1 (pdcv11.pdf)
 
-CHI DOC: chi goi get_feature_report(). Khong bao gio send_feature_report()
+Diem khac biet so voi doc "tho":
+  * Dung COLLECTION PATH (UPS.PowerSummary / UPS.Input / UPS.Output) vi cung
+    mot usage 0x84.0x30 mang nghia khac nhau o moi collection -> neu chi doc
+    report id se doc sai (vd 0x0F la dien ap vao, 0x12 moi la dien ap ra).
+  * Tinh dung do dai tung report tu descriptor de get_feature_report khong bi
+    tu choi (report 0x28/0x29 co 7 byte, khong phai 64).
+  * Gan ten NUT (battery.charge, input.voltage, ups.load...) de doi chieu
+    voi tai lieu NUT.
+
+CHI DOC: khong bao gio goi send_feature_report()
 -> khong the tat UPS, khong doi cau hinh, khong kich hoat self-test.
 
-Cai dat (1 lan):
-    py -m pip install hidapi
-
+Cai dat:  py -m pip install hidapi
 Dung:
-    py ups_full_dump.py                 # in lai moi 5 giay (Ctrl+C de dung)
-    py ups_full_dump.py --interval 2
-    py ups_full_dump.py --once          # in 1 lan
-    py ups_full_dump.py --json          # JSON: moi field thanh 1 key
-    py ups_full_dump.py --quiet         # chi in bang tom tat
-    py ups_full_dump.py --selftest      # kiem tra parser, khong can UPS
+    py ups_full_dump.py                # in lai moi 5 giay
+    py ups_full_dump.py --quiet        # chi bang tom tat
+    py ups_full_dump.py --json         # JSON
+    py ups_full_dump.py --nut          # in ten bien NUT
+    py ups_full_dump.py --selftest     # kiem tra parser, khong can UPS
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from datetime import datetime
 
 from ups_monitor import VENDOR_ID, find_ups_path
 
-# ---- Field DA DOI CHIEU voi thiet bi that, tach theo report id ----
-# Key: (report_id, usage_page, usage). Cung 1 usage (vd 0x30 Voltage) mang nghia
-# khac nhau trong tung collection nen phai khoa theo report id.
-RID_NAMES = {
-    (0x08, 0x85, 0x66): ("RemainingCapacity", 1, "%"),
-    (0x08, 0x85, 0x68): ("RunTimeToEmpty", 1, "s"),
-    (0x08, 0x85, 0x2A): ("RemainingCapacityLimit", 1, "s"),
-    (0x0A, 0x84, 0x30): ("BatteryVoltage", 10, "V"),
-    (0x0B, 0x85, 0xD0): ("ACPresent", 1, ""),
-    (0x0B, 0x85, 0x44): ("Charging", 1, ""),
-    (0x0B, 0x85, 0x45): ("Discharging", 1, ""),
-    (0x0B, 0x85, 0x42): ("BelowRemainingCapacityLimit", 1, ""),
-    (0x0B, 0x85, 0x46): ("RemainingTimeLimitExpired", 1, ""),
-    (0x0B, 0x85, 0x43): ("FullyCharged", 1, ""),
-    (0x0E, 0x84, 0x40): ("InputVoltage", 1, "V"),
-    (0x0F, 0x84, 0x30): ("OutputVoltage", 1, "V"),
-    (0x10, 0x84, 0x53): ("LowVoltageTransfer", 1, "V"),
-    (0x11, 0x84, 0x54): ("HighVoltageTransfer", 1, "V"),
-    (0x12, 0x84, 0x30): ("InputVoltageMeasured", 1, "V"),
-    (0x13, 0x84, 0x35): ("PercentLoad", 1, "%"),
-    (0x14, 0x84, 0x58): ("TemperatureMode", 1, ""),
-    (0x18, 0x84, 0x44): ("OutputVoltageConfig", 10, "V"),
+# =====================================================================
+# Bang usage — Power Device Page 0x84 (PDC v1.0 + v1.1)
+# =====================================================================
+USAGE_PD = {
+    0x01: "iName", 0x02: "PresentStatus", 0x03: "ChangedStatus",
+    0x04: "UPS", 0x05: "PowerSupply",
+    0x10: "BatterySystem", 0x11: "BatterySystemID", 0x12: "Battery",
+    0x13: "BatteryID", 0x14: "Charger", 0x15: "ChargerID",
+    0x16: "PowerConverter", 0x17: "PowerConverterID",
+    0x18: "OutletSystem", 0x19: "OutletSystemID",
+    0x1A: "Input", 0x1B: "InputID", 0x1C: "Output", 0x1D: "OutputID",
+    0x1E: "Flow", 0x1F: "FlowID", 0x20: "Outlet", 0x21: "OutletID",
+    0x22: "Gang", 0x23: "GangID", 0x24: "PowerSummary", 0x25: "PowerSummaryID",
+    0x30: "Voltage", 0x31: "Current", 0x32: "Frequency",
+    0x33: "ApparentPower", 0x34: "ActivePower", 0x35: "PercentLoad",
+    0x36: "Temperature", 0x37: "Humidity", 0x38: "BadCount",
+    0x40: "ConfigVoltage", 0x41: "ConfigCurrent", 0x42: "ConfigFrequency",
+    0x43: "ConfigApparentPower", 0x44: "ConfigActivePower",
+    0x45: "ConfigPercentLoad", 0x46: "ConfigTemperature", 0x47: "ConfigHumidity",
+    0x50: "SwitchOnControl", 0x51: "SwitchOffControl", 0x52: "ToggleControl",
+    0x53: "LowVoltageTransfer", 0x54: "HighVoltageTransfer",
+    0x55: "DelayBeforeReboot", 0x56: "DelayBeforeStartup",
+    0x57: "DelayBeforeShutdown", 0x58: "Test", 0x59: "ModuleReset",
+    0x5A: "AudibleAlarmControl",
+    0x60: "Present", 0x61: "Good", 0x62: "InternalFailure",
+    0x63: "VoltageOutOfRange", 0x64: "FrequencyOutOfRange", 0x65: "Overload",
+    0x66: "OverCharged", 0x67: "OverTemperature", 0x68: "ShutdownRequested",
+    0x69: "ShutdownImminent", 0x6B: "SwitchOnOff", 0x6C: "Switchable",
+    0x6D: "Used", 0x6E: "Boost", 0x6F: "Buck", 0x70: "Initialized",
+    0x71: "Tested", 0x72: "AwaitingPower", 0x73: "CommunicationLost",
+    0xFD: "iManufacturer", 0xFE: "iProduct", 0xFF: "iSerialNumber",
 }
 
-# Fallback: usage da doi chieu o bat ky report nao
-MEASURED = {
-    (0x85, 0xD0): ("ACPresent", 1, ""),
-    (0x85, 0x44): ("Charging", 1, ""),
-    (0x85, 0x45): ("Discharging", 1, ""),
-    (0x85, 0x42): ("BelowRemainingCapacityLimit", 1, ""),
-    (0x85, 0x46): ("RemainingTimeLimitExpired", 1, ""),
-    (0x85, 0x43): ("FullyCharged", 1, ""),
-    (0x85, 0x66): ("RemainingCapacity", 1, "%"),
-    (0x85, 0x68): ("RunTimeToEmpty", 1, "s"),
-    (0x84, 0x35): ("PercentLoad", 1, "%"),
+# =====================================================================
+# Bang usage — Battery System Page 0x85 (PDC v1.1, muc 4.2.x)
+# =====================================================================
+USAGE_BAT = {
+    0x01: "SMBBatteryMode", 0x14: "OptionalMfgFunction5",
+    0x15: "ConnectionToSMBus", 0x16: "OutputConnection",
+    0x17: "ChargerConnection", 0x18: "BatteryInsertion", 0x19: "Usenext",
+    0x1A: "OKToUse", 0x1B: "BatterySupported", 0x1C: "SelectorRevision",
+    0x1D: "ChargingIndicator",
+    0x28: "ManufacturerAccess", 0x29: "RemainingCapacityLimit",
+    0x2A: "RemainingTimeLimit", 0x2B: "AtRate", 0x2C: "CapacityMode",
+    0x2D: "BroadcastToCharger", 0x2E: "PrimaryBattery",
+    0x2F: "ChargeController",
+    0x40: "TerminateCharge", 0x41: "TerminateDischarge",
+    0x42: "BelowRemainingCapacityLimit", 0x43: "RemainingTimeLimitExpired",
+    0x44: "Charging", 0x45: "Discharging", 0x46: "FullyCharged",
+    0x47: "FullyDischarged", 0x48: "ConditioningFlag",
+    0x65: "AbsoluteStateOfCharge", 0x66: "RemainingCapacity",
+    0x67: "FullChargeCapacity", 0x68: "RunTimeToEmpty",
+    0x69: "AverageTimeToEmpty", 0x6A: "AverageTimeToFull",
+    0x6B: "CycleCount",
+    0x80: "BattPackModelLevel", 0x81: "InternalChargeController",
+    0x82: "PrimaryBatterySupport", 0x83: "DesignCapacity",
+    0x84: "SpecificationInfo", 0x85: "ManufacturerDate",
+    0x86: "SerialNumber", 0x87: "iManufacturerName", 0x88: "iDevicename",
+    0x89: "iDeviceChemistry", 0x8A: "ManufacturerData",
+    0x8B: "Rechargable", 0x8C: "WarningCapacityLimit",
+    0x8D: "CapacityGranularity1", 0x8E: "CapacityGranularity2",
+    0x8F: "iOEMInformation",
+    0xD0: "ACPresent",
 }
 
-# ---- Ten theo HID Usage Tables, CHUA doi chieu -> in kem dau '?' ----
-SPEC_NAMES = {
-    0x84: {
-        0x01: "iName", 0x02: "PresentStatus", 0x03: "ChangedStatus", 0x04: "UPS",
-        0x05: "PowerSupply", 0x10: "BatterySystem", 0x11: "BatterySystemID",
-        0x12: "Battery", 0x13: "BatteryID", 0x14: "BatteryCapacity",
-        0x15: "BatteryEnergy", 0x16: "BatteryVoltage", 0x17: "BatteryCurrent",
-        0x18: "BatteryTemperature", 0x1A: "PowerSummary", 0x1C: "PowerConverter",
-        0x24: "Flow", 0x28: "Outlet", 0x30: "Voltage", 0x31: "Current",
-        0x32: "Frequency", 0x33: "ApparentPower", 0x34: "ActivePower",
-        0x35: "PercentLoad", 0x36: "Temperature", 0x37: "Humidity",
-        0x38: "BadCount", 0x39: "ConfigVoltage", 0x3A: "ConfigCurrent",
-        0x3B: "ConfigFrequency", 0x3C: "ConfigApparentPower",
-        0x3D: "ConfigActivePower", 0x3E: "ConfigPercentLoad",
-        0x3F: "ConfigTemperature",
-        0x41: "SwitchOnControl", 0x42: "SwitchOffControl", 0x43: "ToggleControl",
-        0x44: "LowVoltageTransfer", 0x45: "HighVoltageTransfer",
-        0x46: "DelayBeforeReboot", 0x47: "DelayBeforeStartup",
-        0x48: "DelayBeforeShutdown", 0x49: "Test", 0x4A: "AudibleAlarmControl",
-        0x53: "LowVoltageTransfer2", 0x54: "HighVoltageTransfer2",
-        0x57: "DelayBeforeStartup2", 0x58: "DelayBeforeShutdown2",
-        0x66: "Test2", 0x68: "DelayBeforeShutdown3",
-        0x83: "OutletSystem", 0x89: "ConfigActivePower2",
-        0x8B: "ConfigPercentLoad2", 0x8C: "ConfigActivePower3",
-        0x8D: "ConfigPercentLoad3", 0x8E: "ConfigTemperature2",
-        0x8F: "ConfigHumidity2",
-        0xFD: "iProduct", 0xFE: "iManufacturer", 0xFF: "iSerialNumber",
-    },
-    0x85: {
-        0x01: "SMBBatteryMode", 0x29: "RemainingCapacityLimit",
-        0x2A: "RemainingCapacityLimit2", 0x2C: "CapacityMode",
-        0x40: "BelowRemainingCapacityLimit", 0x43: "FullyCharged",
-        0x44: "Charging", 0x45: "Discharging",
-        0x46: "RemainingTimeLimitExpired", 0x47: "RemainingTimeLimit",
-        0x48: "DesignCapacity", 0x49: "FullChargeCapacity",
-        0x53: "DesignCapacity2", 0x54: "FullChargeCapacity2",
-        0x56: "ManufacturerDate", 0x57: "CapacityMode2",
-        0x58: "CapacityGranularity1", 0x59: "CapacityGranularity2",
-        0x5A: "AudibleAlarmControl", 0x66: "RemainingCapacity",
-        0x67: "FullChargeCapacity3", 0x68: "RunTimeToEmpty",
-        0x6E: "RemainingCapacityLimit3", 0xD0: "ACPresent",
-    },
+USAGE_TABLES = {0x84: USAGE_PD, 0x85: USAGE_BAT}
+
+# =====================================================================
+# Bien NUT — lay tu NUT drivers/cps-hid.c (cps_hid2nut)
+# Key = duong dan collection + usage name
+# =====================================================================
+NUT_VARS = {
+    "UPS.PowerSummary.RemainingCapacity": ("battery.charge", "%"),
+    "UPS.PowerSummary.RunTimeToEmpty": ("battery.runtime", "s"),
+    "UPS.PowerSummary.RemainingCapacityLimit": ("battery.charge.low", "%"),
+    "UPS.PowerSummary.WarningCapacityLimit": ("battery.charge.warning", "%"),
+    "UPS.PowerSummary.RemainingTimeLimit": ("battery.runtime.low", "s"),
+    "UPS.PowerSummary.ConfigVoltage": ("battery.voltage.nominal", "0.1V"),
+    "UPS.PowerSummary.Voltage": ("battery.voltage", "0.1V"),
+    "UPS.PowerSummary.FullChargeCapacity": ("battery.status", "%"),
+    "UPS.PowerSummary.DesignCapacity": ("(unmapped) designcapacity", ""),
+    "UPS.PowerSummary.CapacityMode": ("(unmapped) capacitymode", ""),
+    "UPS.PowerSummary.CapacityGranularity1": ("(unmapped) capacitygranularity1", ""),
+    "UPS.PowerSummary.CapacityGranularity2": ("(unmapped) capacitygranularity2", ""),
+    "UPS.PowerSummary.AudibleAlarmControl": ("ups.beeper.status", ""),
+    "UPS.PowerSummary.Temperature": ("ups.temperature", "K"),
+    "UPS.PowerSummary.iProduct": ("ups.model", "stringidx"),
+    "UPS.PowerSummary.iSerialNumber": ("ups.serial", "stringidx"),
+    "UPS.PowerSummary.iManufacturer": ("ups.mfr", "stringidx"),
+    "UPS.PowerSummary.iDeviceChemistry": ("battery.type", "stringidx"),
+    "UPS.PowerSummary.iOEMInformation": ("battery.mfr.date", "stringidx"),
+    "UPS.Input.Voltage": ("input.voltage", "V"),
+    "UPS.Input.ConfigVoltage": ("input.voltage.nominal", "V"),
+    "UPS.Input.Frequency": ("input.frequency", "0.1Hz"),
+    "UPS.Input.LowVoltageTransfer": ("input.transfer.low", "V"),
+    "UPS.Input.HighVoltageTransfer": ("input.transfer.high", "V"),
+    "UPS.Output.Voltage": ("output.voltage", "V"),
+    "UPS.Output.ConfigVoltage": ("output.voltage.nominal", "V"),
+    "UPS.Output.Frequency": ("output.frequency", "0.1Hz"),
+    "UPS.Output.PercentLoad": ("ups.load", "%"),
+    "UPS.Output.ApparentPower": ("ups.power", "VA"),
+    "UPS.Output.ConfigApparentPower": ("ups.power.nominal", "VA"),
+    "UPS.Output.ActivePower": ("ups.realpower", "W"),
+    "UPS.Output.ConfigActivePower": ("ups.realpower.nominal", "W"),
+    "UPS.Output.Test": ("ups.test.result", ""),
+    "UPS.Output.Boost": ("ups.status:BOOST", "bool"),
+    "UPS.Output.Overload": ("ups.status:OVER", "bool"),
+    "UPS.Output.DelayBeforeShutdown": ("ups.timer.shutdown", "s"),
+    "UPS.Output.DelayBeforeStartup": ("ups.timer.start", "s"),
+    "UPS.Output.DelayBeforeReboot": ("ups.timer.reboot", "s"),
+    "UPS.PowerSummary.PresentStatus.ACPresent": ("ups.status:OL", "bool"),
+    "UPS.PowerSummary.PresentStatus.Charging": ("ups.status:CHRG", "bool"),
+    "UPS.PowerSummary.PresentStatus.Discharging": ("ups.status:OB|DISCHRG", "bool"),
+    "UPS.PowerSummary.PresentStatus.BelowRemainingCapacityLimit": ("ups.status:LB", "bool"),
+    "UPS.PowerSummary.PresentStatus.FullyCharged": ("(flag) fullycharged", "bool"),
+    "UPS.PowerSummary.PresentStatus.RemainingTimeLimitExpired": ("(flag) timelimitexpired", "bool"),
 }
 
-# Ma unit HID -> ky hieu
-UNIT_SYMBOLS = {
-    0x00F0D121: "V",
-    0x00E0D121: "J",
-    0x00D121: "W",
-    0x00100001: "A",
-    0x00010001: "K",
-    0x00F001: "Hz",
-    0x1001: "s",
+# Gia tri vat ly da doi chieu tren chinh thiet bi nay.
+# Key = ten usage trong dung collection -> (he so chia, don vi, ghi chu)
+SCALE = {
+    ("UPS.PowerSummary", "Voltage"): (10, "V", "pin 3x12V: 360 -> 36.0V"),
+    ("UPS.PowerSummary", "ConfigVoltage"): (10, "V", "dinh muc pin"),
+    ("UPS.PowerSummary", "RemainingCapacity"): (1, "%", ""),
+    ("UPS.PowerSummary", "FullChargeCapacity"): (1, "%", ""),
+    ("UPS.PowerSummary", "RemainingCapacityLimit"): (1, "%", ""),
+    ("UPS.PowerSummary", "WarningCapacityLimit"): (1, "%", ""),
+    ("UPS.PowerSummary", "RunTimeToEmpty"): (1, "s", ""),
+    ("UPS.PowerSummary", "RemainingTimeLimit"): (1, "s", ""),
+    ("UPS.Input", "Voltage"): (1, "V", "0 khi mat dien luoi"),
+    ("UPS.Input", "ConfigVoltage"): (1, "V", "dien ap danh dinh"),
+    ("UPS.Input", "LowVoltageTransfer"): (1, "V", ""),
+    ("UPS.Input", "HighVoltageTransfer"): (1, "V", ""),
+    ("UPS.Output", "Voltage"): (1, "V", "dien ap ra"),
+    ("UPS.Output", "PercentLoad"): (1, "%", ""),
+    ("UPS.Output", "ConfigActivePower"): (1, "W", "cong suat thuc dinh muc"),
+    ("UPS.Output", "DelayBeforeShutdown"): (1, "s", ""),
+    ("UPS.Output", "DelayBeforeStartup"): (1, "s", ""),
+}
+
+ENUMS = {
+    ("UPS.Output", "Test"): {0: "no test", 1: "quick test", 2: "deep test", 3: "abort", 4: "passed", 5: "failed"},
+    ("UPS.PowerSummary", "AudibleAlarmControl"): {1: "disabled", 2: "enabled", 3: "muted"},
+    ("UPS.PowerSummary", "CapacityMode"): {0: "mAh/mWh", 1: "percent", 2: "percent?"},
 }
 
 
 class Field:
-    __slots__ = ("usage_page", "usage", "bit_offset", "bit_size", "count",
-                 "logical_min", "logical_max", "unit", "unit_exp", "report_id")
+    __slots__ = ("page", "usage", "offset", "size", "count", "path", "kind",
+                 "rid", "logical_min", "logical_max", "units", "unit_exp")
 
-    def __init__(self, usage_page, usage, bit_offset, bit_size, count,
-                 logical_min, logical_max, unit, unit_exp, report_id=0):
-        self.usage_page = usage_page
+    def __init__(self, page, usage, offset, size, count, path, kind, rid,
+                 logical_min=0, logical_max=0, units=0, unit_exp=0):
+        self.page = page
         self.usage = usage
-        self.bit_offset = bit_offset
-        self.bit_size = bit_size
+        self.offset = offset
+        self.size = size
         self.count = count
+        self.path = path          # vd "UPS.PowerSummary.PresentStatus"
+        self.kind = kind
+        self.rid = rid
         self.logical_min = logical_min
         self.logical_max = logical_max
-        self.unit = unit
+        self.units = units
         self.unit_exp = unit_exp
-        self.report_id = report_id
 
     @property
-    def measured(self):
-        return RID_NAMES.get((self.report_id, self.usage_page, self.usage)) \
-            or MEASURED.get((self.usage_page, self.usage))
+    def name(self):
+        return USAGE_TABLES.get(self.page, {}).get(self.usage, f"usage_{self.page:02x}_{self.usage:02x}")
 
-    def label(self):
-        hit = self.measured
-        if hit:
-            return hit[0]
-        spec = SPEC_NAMES.get(self.usage_page, {}).get(self.usage)
-        if spec:
-            return spec + "?"
-        return f"usage_{self.usage_page:02x}_{self.usage:02x}"
+    @property
+    def full_path(self):
+        return f"{self.path}.{self.name}" if self.path else self.name
+
+    def nut(self):
+        return NUT_VARS.get(self.full_path)
 
     def values(self, payload: bytes):
-        """payload = report bytes KHONG gom report id."""
-        if self.bit_size == 0 or self.count == 0:
+        if self.size == 0 or self.count == 0:
             return []
-        data = int.from_bytes(payload, "little")
-        mask = (1 << self.bit_size) - 1
+        raw = int.from_bytes(payload, "little")
+        mask = (1 << self.size) - 1
         signed = self.logical_min < 0
         out = []
         for i in range(self.count):
-            raw = (data >> (self.bit_offset + i * self.bit_size)) & mask
-            if signed and raw >= (1 << (self.bit_size - 1)):
-                raw -= 1 << self.bit_size
-            out.append(raw)
+            v = (raw >> (self.offset + i * self.size)) & mask
+            if signed and v >= (1 << (self.size - 1)):
+                v -= 1 << self.size
+            out.append(v)
         return out
 
-    def physical(self, raw: int):
-        """Chuoi gia tri vat ly CHI khi da doi chieu; nguoc lai None."""
-        hit = self.measured
-        if not hit or not hit[2]:
-            return None
-        _, scale, unit = hit
-        text = f"{raw / scale:.1f}" if scale != 1 else str(raw)
-        return f"{text} {unit}"
+    def interpret(self, value: int) -> str:
+        enum = ENUMS.get((self.path, self.name))
+        if enum and value in enum:
+            return enum[value]
+        hit = SCALE.get((self.path, self.name))
+        if hit:
+            div, unit, _note = hit
+            text = f"{value / div:.1f}" if div != 1 else str(value)
+            return f"{text} {unit}".strip()
+        return ""
 
 
 def _signed(raw: int, size: int) -> int:
@@ -188,15 +249,21 @@ def _signed(raw: int, size: int) -> int:
 
 
 def parse_descriptor(desc: bytes):
-    """Tra ve {"input"|"output"|"feature": {report_id: [Field, ...]}}."""
+    """Tra ve {"input"|"output"|"feature": {rid: [Field]}}, co collection path."""
     result = {"input": {}, "output": {}, "feature": {}}
-    g = dict(usage_page=0, logical_min=0, logical_max=0, report_size=0,
-             report_count=0, report_id=0, unit=0, unit_exp=0)
+    g = dict(page=0, lmin=0, lmax=0, rsize=0, rcount=0, rid=0, unit=0, uexp=0)
     stack = []
-    usages = []
-    usage_min = usage_max = None
-    offsets = {}
+    collections: list[str] = []
+    usages: list[tuple[int, int]] = []
+    umin = umax = None
+    offsets: dict[tuple[str, int], int] = {}
     i, n = 0, len(desc)
+
+    def add(kind, rid, page, usage, offset, size, count):
+        path = ".".join(collections)
+        result[kind].setdefault(rid, []).append(
+            Field(page, usage, offset, size, count, path, kind, rid,
+                  g["lmin"], g["lmax"], g["unit"], g["uexp"]))
 
     while i < n:
         prefix = desc[i]
@@ -210,22 +277,22 @@ def parse_descriptor(desc: bytes):
 
         if typ == 1:  # Global
             if tag == 0:
-                g["usage_page"] = raw
+                g["page"] = raw
             elif tag == 1:
-                g["logical_min"] = _signed(raw, size)
+                g["lmin"] = _signed(raw, size)
             elif tag == 2:
-                g["logical_max"] = _signed(raw, size) if g["logical_min"] < 0 else raw
+                g["lmax"] = _signed(raw, size) if g["lmin"] < 0 else raw
             elif tag == 5:
                 nib = raw & 0x0F
-                g["unit_exp"] = nib - 16 if nib >= 8 else nib
+                g["uexp"] = nib - 16 if nib >= 8 else nib
             elif tag == 6:
                 g["unit"] = raw
             elif tag == 7:
-                g["report_size"] = raw
+                g["rsize"] = raw
             elif tag == 8:
-                g["report_id"] = raw
+                g["rid"] = raw
             elif tag == 9:
-                g["report_count"] = raw
+                g["rcount"] = raw
             elif tag == 10:
                 stack.append(dict(g))
             elif tag == 11 and stack:
@@ -235,137 +302,148 @@ def parse_descriptor(desc: bytes):
                 if size == 4:
                     usages.append((raw >> 16, raw & 0xFFFF))
                 else:
-                    usages.append((g["usage_page"], raw))
+                    usages.append((g["page"], raw))
             elif tag == 1:
-                usage_min = raw
+                umin = raw
             elif tag == 2:
-                usage_max = raw
-        else:  # Main: 8=Input 9=Output 0xB=Feature 0xA=Collection 0xC=EndCollection
-            if tag in (8, 9, 11):
+                umax = raw
+        else:  # Main
+            if tag == 0xA:  # Collection
+                page, usage = (usages[0] if usages else (g["page"], 0))
+                table = USAGE_TABLES.get(page, {})
+                name = table.get(usage)
+                if not name:
+                    # page 0xFF01 = khoi vendor rieng cua CyberPower, khong co
+                    # trong PDC spec lan NUT -> khong the dat ten
+                    name = (f"VENDOR_{page:04x}_{usage:02x}" if page not in (0x84, 0x85)
+                            else f"col_{usage:02x}")
+                collections.append(name)
+            elif tag == 0xC:  # EndCollection
+                if collections:
+                    collections.pop()
+            elif tag in (8, 9, 11):  # Input / Output / Feature
                 kind = {8: "input", 9: "output", 11: "feature"}[tag]
-                fields = list(usages)
-                if usage_min is not None and usage_max is not None:
-                    fields += [(g["usage_page"], u) for u in range(usage_min, usage_max + 1)]
-                rid = g["report_id"]
-                key = (kind, rid)
+                items = list(usages)
+                if umin is not None and umax is not None:
+                    items += [(g["page"], u) for u in range(umin, umax + 1)]
+                key = (kind, g["rid"])
                 offset = offsets.get(key, 0)
-                size_bits = g["report_size"]
+                rsize, rcount = g["rsize"], g["rcount"]
 
-                if not fields:
-                    offset += size_bits * g["report_count"]  # padding
-                elif len(fields) == 1:
-                    result[kind].setdefault(rid, []).append(
-                        Field(fields[0][0], fields[0][1], offset, size_bits,
-                              g["report_count"], g["logical_min"], g["logical_max"],
-                              g["unit"], g["unit_exp"], rid))
-                    offset += size_bits * g["report_count"]
+                if not items:
+                    offset += rsize * rcount
+                elif len(items) == 1:
+                    add(kind, g["rid"], items[0][0], items[0][1], offset, rsize, rcount)
+                    offset += rsize * rcount
                 else:
-                    each = max(1, g["report_count"] // len(fields))
-                    for page, usage in fields:
-                        result[kind].setdefault(rid, []).append(
-                            Field(page, usage, offset, size_bits, each,
-                                  g["logical_min"], g["logical_max"],
-                                  g["unit"], g["unit_exp"], rid))
-                        offset += size_bits * each
-
+                    each = max(1, rcount // len(items))
+                    for page, usage in items:
+                        add(kind, g["rid"], page, usage, offset, rsize, each)
+                        offset += rsize * each
                 offsets[key] = offset
             usages = []
-            usage_min = usage_max = None
+            umin = umax = None
 
     return result
 
 
-def _hexdump(payload: bytes) -> str:
-    return " ".join(f"{b:02x}" for b in payload)
+def report_lengths(fields_by_kind):
+    """Do dai byte CAN THIET cua tung report (gom 1 byte report id)."""
+    lens = {}
+    for kind, by_id in fields_by_kind.items():
+        lens[kind] = {}
+        for rid, fields in by_id.items():
+            bits = max((f.offset + f.size * f.count) for f in fields)
+            lens[kind][rid] = 1 + math.ceil(bits / 8)
+    return lens
 
 
-def dump_device(dev, fields_by_kind, verbose=True):
-    """In toan bo field cua moi feature report. Tra ve dict cho --json."""
-    out = {}
-    per_report = {}
-    print(f"\n===== {datetime.now().strftime('%H:%M:%S')}  =====================")
-
-    readable = 0
+def read_all(dev, fields_by_kind, lens):
+    """Doc moi feature report. Tra ve list[(rid, payload, fields)]."""
+    out = []
     for rid in sorted(fields_by_kind["feature"]):
-        fields = fields_by_kind["feature"][rid]
+        want = lens["feature"][rid]
         try:
-            raw = dev.get_feature_report(rid, 64)
-        except OSError:
-            if verbose:
-                print(f"\n[0x{rid:02x}] khong doc duoc (driver tu choi)")
+            raw = dev.get_feature_report(rid, want)
+        except OSError as exc:
+            out.append((rid, None, exc))
             continue
         if not raw or raw[0] != rid:
-            if verbose:
-                print(f"\n[0x{rid:02x}] khong co du lieu")
+            out.append((rid, None, "no data"))
             continue
+        out.append((rid, bytes(raw[1:want]), fields_by_kind["feature"][rid]))
+    return out
 
-        payload = bytes(raw[1:])
-        readable += 1
-        rows = []
+
+def print_report(reports, verbose=True, show_nut=False):
+    data = {}
+    ok = 0
+    if verbose:
+        print(f"\n===== {datetime.now().strftime('%H:%M:%S')}  =====================")
+    for rid, payload, fields in reports:
+        if payload is None:
+            if verbose:
+                print(f"\n[0x{rid:02x}] {fields}")
+            continue
+        ok += 1
+        if verbose:
+            print(f"\n[0x{rid:02x}] {len(payload)}B: " + " ".join(f"{b:02x}" for b in payload))
         for f in fields:
             vals = f.values(payload)
             if not vals:
                 continue
-            label = f.label()
+            nut = f.nut()
+            key = nut[0] if nut else f.full_path
             if len(vals) == 1:
-                phys = f.physical(vals[0])
-                rows.append((label, vals[0], phys))
-                out[label] = vals[0]
+                data[key] = vals[0]
+                if verbose:
+                    line = f"   {f.full_path:<46} {vals[0]:>7}"
+                    text = f.interpret(vals[0])
+                    if text:
+                        line += f"   {text}"
+                    if show_nut and nut:
+                        line += f"   -> NUT {nut[0]}"
+                    print(line)
             else:
-                rows.append((label, vals, None))
-                out[label] = vals
-
-        per_report[rid] = {"raw": _hexdump(payload), "fields": rows}
-        if verbose:
-            print(f"\n[0x{rid:02x}] {len(payload)} byte: {_hexdump(payload)}")
-            for label, val, phys in rows:
-                if isinstance(val, list):
-                    print(f"   {label:<28} raw={val}")
-                elif phys is None:
-                    print(f"   {label:<28} raw={val}")
-                else:
-                    print(f"   {label:<28} raw={val:<10} {phys}")
-
+                data[key] = vals
+                if verbose:
+                    print(f"   {f.full_path:<46} {vals}")
     if verbose:
-        print(f"\n[feature] doc duoc {readable}/{len(fields_by_kind['feature'])} report")
-        if fields_by_kind["input"]:
-            ids = ", ".join(f"0x{r:02x}" for r in sorted(fields_by_kind["input"]))
-            print(f"[input]   report id co trong descriptor: {ids}")
-            print("          interrupt IN - UPS chi gui khi co thay doi")
+        print(f"\n[feature] doc duoc {ok}/{len(reports)} report")
 
-    out["_reports"] = per_report
-    return out
+    nuts = {k: v for k, v in data.items() if "." in k and not k.startswith("(")}
+    return {"raw": data, "nut": nuts}
 
 
-def print_summary(data):
-    """Bang tom tat nhung gi da doi chieu duoc."""
-    online = data.get("ACPresent")
-    if online is None:
-        grid = "n/a"
-    else:
-        grid = "CO" if online else "MAT"
+def print_summary(nut):
+    def g(name, default=None):
+        return nut.get(name, default)
 
-    runtime = data.get("RunTimeToEmpty")
-    runtime_min = f"{runtime // 60} phut" if isinstance(runtime, int) else "n/a"
+    online = g("ups.status:OL")
+    charge = g("battery.charge")
+    runtime = g("battery.runtime")
+    batt_v = g("battery.voltage")
+    in_v = g("input.voltage")
+    out_v = g("output.voltage")
+    load = g("ups.load")
+    pnom = g("ups.realpower.nominal")
 
-    battery_v = data.get("BatteryVoltage")
-    battery_v_text = f"{battery_v / 10:.1f} V" if isinstance(battery_v, int) else "n/a"
+    def v(fmt, x, unit=""):
+        return f"{fmt.format(x)}{unit}" if isinstance(x, (int, float)) else "n/a"
 
-    charge = data.get("RemainingCapacity")
-    load = data.get("PercentLoad")
-
-    print("\n--- TOM TAT ---")
-    print(f"  dien luoi        : {grid}")
-    print(f"  pin              : {charge if charge is not None else 'n/a'} %")
-    print(f"  thoi gian con lai: {runtime_min}")
-    print(f"  dien ap pin      : {battery_v_text}")
-    print(f"  dien ap vao      : {data.get('InputVoltage', 'n/a')} V"
-          + ("  (gia tri cuoi - dang chay pin)" if online == 0 else ""))
-    print(f"  tai              : {load if load is not None else 'n/a'} %")
-    for flag in ("Charging", "Discharging", "FullyCharged",
-                 "BelowRemainingCapacityLimit", "RemainingTimeLimitExpired"):
-        if flag in data:
-            print(f"  {flag:<32}: {data[flag]}")
+    print("\n--- TOM TAT (theo bien NUT) ---")
+    print(f"  dien luoi (OL)     : {'CO' if online else 'MAT' if online == 0 else 'n/a'}")
+    print(f"  battery.charge     : {v('{:.0f}', charge, ' %')}")
+    print(f"  battery.runtime    : {v('{:.0f}', runtime and runtime, ' s')}"
+          + (f"  (~{runtime // 60} phut)" if isinstance(runtime, int) else ""))
+    print(f"  battery.voltage    : {v('{:.1f}', batt_v and batt_v / 10, ' V')}")
+    print(f"  input.voltage      : {v('{:.0f}', in_v, ' V')}")
+    print(f"  output.voltage     : {v('{:.0f}', out_v, ' V')}")
+    print(f"  ups.load           : {v('{:.0f}', load, ' %')}")
+    print(f"  ups.realpower.nom. : {v('{:.0f}', pnom, ' W')}")
+    for flag in ("ups.status:CHRG", "ups.status:OB|DISCHRG", "ups.status:LB"):
+        if flag in nut:
+            print(f"  {flag:<19}: {nut[flag]}")
 
 
 def run_selftest():
@@ -377,59 +455,87 @@ def run_selftest():
             print(f"FAIL {name}: got={got!r} want={want!r}")
             fails += 1
 
-    # 1. bitfield 6 x 1 bit: byte 0x04 -> bit2 bat
-    f = Field(0x85, 0xD0, 0, 1, 6, 0, 1, 0, 0, 0x0B)
-    vals = f.values(b"\x04")
-    check("bitfield len", len(vals), 6)
-    check("ACPresent bit0", vals[0], 0)
-    check("Discharging bit2", vals[2], 1)
-
-    # 2. u16 little endian
-    check("u16", Field(0x85, 0x68, 0, 16, 1, 0, 0xFFFF, 0, 0).values(b"\x0c\x30")[0], 12300)
-
-    # 3. signed 8 bit
-    check("signed -3", Field(0x84, 0x30, 0, 8, 1, -5, 5, 0, 0).values(b"\xfd")[0], -3)
-
-    # 4. he so chia: 360 -> 36.0 V (report 0x0A = dien ap pin)
-    check("voltage scale",
-          Field(0x84, 0x30, 0, 16, 1, 0, 0xFFFF, 0, 0, 0x0A).physical(360), "36.0 V")
-
-    # 5. parser: 0x0B co 6 field input + 6 field feature
-    partial = bytes.fromhex(
-        "0504" "a101" "0924" "a100" "0902" "a102"
-        "850b" "0585" "09d0" "0944" "0945" "0942" "0946" "0943"
-        "1500" "2501" "7501" "9506" "8122" "7502" "9501" "8103"
-        "09d0" "0944" "0945" "0942" "0946" "0943"
-        "1500" "2501" "7501" "9506" "b1a2" "7502" "9501" "b103"
+    desc = bytes.fromhex(
+        # App collection -> PowerSummary (physical) -> PresentStatus (logical)
+        "0584" "0904" "a101" "0924" "a100" "0902" "a102"
+        "850b" "0585"
+        "09d009440945094209460943"
+        "15002501750195068122" "750295018103"
+        "09d009440945094209460943"
+        "1500250175019506b1a2" "75029501b103"
+        "c0"
+        # Battery reports (page 0x85)
+        "0585" "8508"
+        "0966" "15002564" "75089501b1a2"
+        "0968" "1500" "27ffff0000" "75109501b1a2"
+        "092a" "1500" "265802" "75109501b1a2"
+        # Tro lai page 0x84: pin
+        "0584" "8509" "0940" "1500" "27ffff0000" "75109501b1a2"
+        "850a" "0930" "1500" "27ffff0000" "75109501b1a2"
+        "c0"                      # het PowerSummary
+        "0584" "091a" "a100"      # Input (usage 0x1A)
+        "850e" "0940" "1500" "26ff00" "75089501b122"
+        "850f" "0930" "1500" "26ff01" "75109501b1a2"
+        "c0"
+        "091c" "a100"             # Output (usage 0x1C)
+        "8512" "0930" "1500" "26ff01" "75109501b1a2"
+        "8513" "0935" "1500" "26ff00" "75089501b1a2"
+        "8518" "0944" "1500" "27ffff0000" "75109501b1a2"
+        "c0"
+        "c0"                      # het App collection
     )
-    parsed = parse_descriptor(partial)
-    check("feature 0x0b fields", len(parsed["feature"].get(0x0B, [])), 6)
-    check("input 0x0b fields", len(parsed["input"].get(0x0B, [])), 6)
+    p = parse_descriptor(desc)
+    lens = report_lengths(p)
 
-    # 6. bit offset field thu 5 = 4
-    check("bit offset #5", parsed["feature"][0x0B][4].bit_offset, 4)
+    # 1. bitfield: byte 0x04 -> bit2 bat (Discharging)
+    f0b = {f.name: f for f in p["feature"][0x0B]}
+    check("0x0b co 6 field", len(f0b), 6)
+    check("bit2 Discharging", f0b["Discharging"].values(b"\x04")[0], 1)
+    check("bit0 ACPresent", f0b["ACPresent"].values(b"\x04")[0], 0)
+
+    # 2. do dai report tinh tu descriptor (fix loi 0x28/0x29)
+    check("len feature 0x0b", lens["feature"][0x0B], 2)
+    check("len input 0x0b", lens["input"][0x0B], 2)
+    check("len feature 0x08", lens["feature"][0x08], 6)
+
+    # 3. collection path — loi co ban cua ban truoc
+    check("path 0x0a", p["feature"][0x0A][0].path, "UPS.PowerSummary")
+    check("path 0x0b", p["feature"][0x0B][0].path, "UPS.PowerSummary.PresentStatus")
+    check("path 0x0e", p["feature"][0x0E][0].path, "UPS.Input")
+    check("path 0x12", p["feature"][0x12][0].path, "UPS.Output")
+
+    # 4. ten usage dung (0x44 = ConfigActivePower, khong phai Charging)
+    check("0x18 usage name", p["feature"][0x18][0].name, "ConfigActivePower")
+    check("0x53 = LowVoltageTransfer", USAGE_PD[0x53], "LowVoltageTransfer")
+    check("0x46 = FullyCharged", USAGE_BAT[0x46], "FullyCharged")
+
+    # 5. scale: pin 360 -> 36.0 V
+    fv = p["feature"][0x0A][0]
+    check("battery voltage scale", fv.interpret(360), "36.0 V")
+
+    # 6. NUT mapping
+    check("nut battery.voltage", fv.nut()[0], "battery.voltage")
 
     if fails == 0:
-        print("SELFTEST OK (7 kiem tra)")
+        print("SELFTEST OK (13 kiem tra)")
         return 0
     print(f"SELFTEST FAIL ({fails} loi)")
     return 1
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="In tat ca du lieu UPS doc duoc (chi doc)")
-    ap.add_argument("--once", action="store_true", help="in mot lan roi thoat")
-    ap.add_argument("--json", action="store_true", help="in JSON thay vi bang")
-    ap.add_argument("--interval", type=float, default=5.0, help="giay giua 2 lan in")
-    ap.add_argument("--quiet", action="store_true", help="chi in bang tom tat")
-    ap.add_argument("--selftest", action="store_true", help="kiem tra parser")
+    ap = argparse.ArgumentParser(description="In moi du lieu UPS doc duoc (chi doc)")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--nut", action="store_true", help="in them ten bien NUT")
+    ap.add_argument("--interval", type=float, default=5.0)
+    ap.add_argument("--quiet", action="store_true", help="chi bang tom tat")
+    ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
 
     if args.selftest:
         return run_selftest()
 
-    # Khi stdout bi redirect (chay nhu service / pipe) Python buffer theo block
-    # -> ep line buffering de log ra ngay.
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError):
@@ -448,33 +554,44 @@ def main(argv=None):
         model = dev.get_product_string() or "?"
     except OSError:
         model = "?"
-
     try:
-        desc = bytes(dev.get_report_descriptor())
-    except (OSError, AttributeError):
-        print("Khong doc duoc HID report descriptor.")
-        dev.close()
-        return 3
+        mfr = dev.get_manufacturer_string() or "?"
+    except OSError:
+        mfr = "?"
+    try:
+        serial = dev.get_serial_number_string() or "(rong)"
+    except OSError:
+        serial = "(loi)"
 
-    fields_by_kind = parse_descriptor(desc)
+    fields_by_kind = parse_descriptor(bytes(dev.get_report_descriptor()))
+    lens = report_lengths(fields_by_kind)
     verbose = not args.quiet and not args.json
+
     if verbose:
-        print(f"UPS: {model}   descriptor {len(desc)} byte   "
-              f"feature report: {len(fields_by_kind['feature'])}")
+        print(f"UPS: {mfr} / {model} / serial={serial}")
+        print(f"     feature report: {len(fields_by_kind['feature'])}"
+              f"   input report: {len(fields_by_kind['input'])}"
+              f"   (VID 0x{VENDOR_ID:04x})")
         print("Chi doc (get_feature_report). Ctrl+C de dung.")
+        print("Luu y: report 0x25-0x2D nam trong usage page 0xFF01 (vendor rieng")
+        print("       cua CyberPower, khong co trong spec PDC va khong co trong NUT)")
+        print("       -> khong the dat ten, va tren may nay doc ra toan 0.")
 
     try:
         while True:
-            data = dump_device(dev, fields_by_kind, verbose=verbose)
+            reports = read_all(dev, fields_by_kind, lens)
+            result = print_report(reports, verbose=verbose, show_nut=args.nut)
             if args.json:
                 print(json.dumps({
                     "ts": datetime.now().astimezone().isoformat(),
                     "model": model,
-                    "source": "hid-descriptor",
-                    "fields": data,
+                    "manufacturer": mfr,
+                    "serial": serial,
+                    "source": "hid-descriptor+nut",
+                    **result,
                 }, ensure_ascii=False, default=str), flush=True)
             else:
-                print_summary(data)
+                print_summary(result["nut"])
             if args.once:
                 return 0
             time.sleep(args.interval)
