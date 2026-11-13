@@ -1,25 +1,11 @@
-# Edge V2 controller worker
+# Edge V2 canonical controller discovery
 
-Configure trusted device identity and LAN IPv4 address once via deployment
-configuration (environment variables or secret store, never commit keys):
- 
-EdgeGateway__EdgeV2Devices__0__DeviceCode
-EdgeGateway__EdgeV2Devices__0__LocalIp (optional; omit for LAN registration discovery)
-EdgeGateway__EdgeV2Devices__0__DeviceKey
-EdgeGateway__EdgeV2Devices__0__LocalKey
- 
-Use HTTPS BackendUrl; an explicitly configured local IP must be a private IPv4 address. Otherwise the Kiosk learns the candidate from the registration socket, not the payload. It verifies the signed inventory before using the endpoint. The
-controller must have the matching local HMAC key provisioned by physical USB.
-No manual channel list or static IP required when registration reaches Kiosk directly. Signed manifest is read each cycle and uploaded to BE,
-then commands are polled with X-Device-Key and X-Edge-Protocol: 2. Firmware must
-support the signed inventory command and inventoryRevision. The worker checks
-the lease, sequence, revision, identity and signed acknowledgement. It never
-uses a telemetry-supplied URL. Separate per-device loops. Legacy worker no
-longer sends unsigned commands; existing telemetry forwarding is unchanged.
- 
-Do not run the old reference Python bridge at the same time for these devices.
-ON is still disabled in RC2 and BE deployment lock must remain enabled until
-hardware tests. No physical load detection is claimed. Test on isolated LAN,
-with loads disconnected, then validate real interlocks before any actuation.
+The Kiosk consumes the signed heartbeat `capabilities` returned by hardware-device-controller and forwards it directly to POST /api/iot/controllers/capabilities. The cloud's accepted configVersion, boundOutputChannels, and hardwareControlDisabled response is checked before leasing commands. If sequence storage is not ready or control is globally locked, only inventory and observations are sent. OFF can address a current reported output; ON requires a cloud-verified binding and remains physically locked in the current firmware.
 
-The worker records the latest signed output snapshot through PUT /api/controllers/{deviceCode}/ports/observations, including unbound channels, and updates existing RAS observations separately. A GPIO state is not proof that mains current flows or a pump operates.
+Configure trusted device identity once using a secret store:
+- EdgeGateway__EdgeV2Devices__0__DeviceCode
+- EdgeGateway__EdgeV2Devices__0__DeviceKey
+- EdgeGateway__EdgeV2Devices__0__LocalKey
+- EdgeGateway__EdgeV2Devices__0__LocalIp (optional; otherwise learned from registration socket and verified with HMAC)
+
+BackendUrl must use HTTPS. No manual channel list. Never commit keys. Command envelopes are revision-bound and signed; ACK uses the current delivery attempt and verified response. PUT /api/iot/controllers/{deviceCode}/ports/observations stores current signed GPIO observations; legacy RAS status is updated only for verified bindings. GPIO state is not proof of load operation. Do not run the Python reference bridge simultaneously. No FE changes. Requires BE revision-bound command and observation update and compatible hardware firmware.

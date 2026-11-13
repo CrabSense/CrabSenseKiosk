@@ -69,25 +69,38 @@ public sealed class EdgeV2Worker : BackgroundService
     {
         using var client = _clients.CreateClient("controller-inventory");
         client.Timeout = TimeSpan.FromSeconds(3);
-        var inventory = await LocalAsync(client, d, Envelope(d, "inventory", 10), ct);
-        if (!inventory.GetProperty("success").GetBoolean()) throw new InvalidOperationException("Inventory rejected.");
-        var manifest = inventory.GetProperty("manifest");
-        var revision = manifest.GetProperty("revision").GetInt64();
-        if (revision < 1 || manifest.GetProperty("schemaVersion").GetInt32() != 1)
-            throw new InvalidOperationException("Invalid manifest.");
-        var channels = manifest.GetProperty("ports").EnumerateArray()
-            .Where(p => p.GetProperty("present").GetBoolean() && p.GetProperty("direction").GetString() == "output"
-                && p.GetProperty("kind").GetString() is "ssr" or "relay")
-            .Select(p => int.Parse(p.GetProperty("channel").GetString()!, System.Globalization.CultureInfo.InvariantCulture))
-            .ToHashSet();
-        if (channels.Count == 0 || channels.Any(c => c < 1 || c > 16))
-            throw new InvalidOperationException("Invalid channel inventory.");
-
-        await CloudAsync(client, cloud, d, HttpMethod.Put,
-            $"api/controllers/{Uri.EscapeDataString(d.DeviceCode)}/ports/manifest", manifest, ct);
+        // The production firmware returns capabilities in its signed heartbeat.
+        // No unsigned /api/info or second manifest format is trusted.
         var heartbeat = await LocalAsync(client, d, Envelope(d, "heartbeat", 5), ct);
         if (!heartbeat.GetProperty("success").GetBoolean()) throw new InvalidOperationException("Heartbeat rejected.");
-
+        var manifest = heartbeat.GetProperty("capabilities");
+        var revision = manifest.GetProperty("configVersion").GetInt32();
+        if (revision < 1 || manifest.GetProperty("deviceCode").GetString() != d.DeviceCode)
+            throw new InvalidOperationException("Invalid signed capability identity/revision.");
+        var channels = manifest.GetProperty("ports").EnumerateArray()
+            .Where(p => p.GetProperty("type").GetString() == "DIGITAL_OUTPUT")
+            .Select(p => p.GetProperty("channel").GetInt32()).ToHashSet();
+        var stateChannels = heartbeat.GetProperty("outputs").EnumerateArray()
+            .Select(x => x.GetProperty("channel").GetInt32()).ToArray();
+        if (channels.Count == 0 || channels.Any(ch => ch < 1 || ch > 32)
+            || stateChannels.Length != channels.Count || !stateChannels.ToHashSet().SetEquals(channels))
+            throw new InvalidOperationException("Signed capability/state mismatch.");
+        var accepted = await CloudAsync(client, cloud, d, HttpMethod.Post,
+            "api/iot/controllers/capabilities", manifest, ct);
+        var data = accepted.GetProperty("data");
+        if (data.GetProperty("configVersion").GetInt32() != revision)
+            throw new InvalidOperationException("Cloud did not accept the signed revision.");
+        var bound = data.GetProperty("boundOutputChannels").EnumerateArray()
+            .Select(x => x.GetInt32()).ToHashSet();
+        if (!bound.IsSubsetOf(channels)) throw new InvalidOperationException("Invalid cloud bindings.");
+        // Discovery must still work while live control is disabled or NVS
+        // sequence storage is unsafe. Do not even lease commands in this state.
+        if (data.GetProperty("hardwareControlDisabled").GetBoolean()
+            || !heartbeat.TryGetProperty("commandStorageReady", out var ready) || !ready.GetBoolean())
+        {
+            await ReportStatesAsync(client, cloud, d, heartbeat, channels, bound, revision, ct);
+            return;
+        }
         var latest = heartbeat;
         var pending = await CloudAsync(client, cloud, d, HttpMethod.Get,
             $"api/edge/commands/pending?deviceCode={Uri.EscapeDataString(d.DeviceCode)}", null, ct);
@@ -109,7 +122,8 @@ public sealed class EdgeV2Worker : BackgroundService
             var channel = 0;
             var validChannel = action == "alloff"
                 ? cmd.GetProperty("channel").ValueKind == JsonValueKind.Null
-                : int.TryParse(cmd.GetProperty("channel").GetString(), out channel) && channels.Contains(channel);
+                : int.TryParse(cmd.GetProperty("channel").GetString(), out channel) && channels.Contains(channel)
+                    && (action != "on" || bound.Contains(channel));
             if (!validChannel || !cmd.TryGetProperty("inventoryRevision", out var rev) ||
                 rev.ValueKind != JsonValueKind.Number || rev.GetInt64() != revision)
             {
@@ -133,7 +147,7 @@ public sealed class EdgeV2Worker : BackgroundService
                 result.GetProperty("message").GetString() ?? "", ct);
             if (result.TryGetProperty("outputs", out _)) latest = result;
         }
-        await ReportStatesAsync(client, cloud, d, latest, channels, revision, ct);
+        await ReportStatesAsync(client, cloud, d, latest, channels, bound, revision, ct);
     }
 
     private static Dictionary<string, object> Envelope(EdgeV2Device d, string kind, int seconds) => new()
@@ -187,20 +201,20 @@ public sealed class EdgeV2Worker : BackgroundService
             new { status = success ? "acknowledged" : "failed", deliveryAttemptId = attempt, message }, ct);
 
     private async Task ReportStatesAsync(HttpClient client, Uri cloud, EdgeV2Device d, JsonElement result,
-        HashSet<int> channels, long revision, CancellationToken ct)
+        HashSet<int> channels, HashSet<int> bound, long revision, CancellationToken ct)
     {
         var states = result.GetProperty("outputs").EnumerateArray().ToArray();
         if (states.Length != channels.Count || !states.Select(s => s.GetProperty("channel").GetInt32()).ToHashSet().SetEquals(channels))
             throw new InvalidOperationException("Invalid observed channels.");
         await CloudAsync(client, cloud, d, HttpMethod.Put,
-            $"api/controllers/{Uri.EscapeDataString(d.DeviceCode)}/ports/observations",
-            new { revision, outputs = states.Select(s => new {
-                channel = s.GetProperty("channel").GetInt32().ToString(System.Globalization.CultureInfo.InvariantCulture),
+            $"api/iot/controllers/{Uri.EscapeDataString(d.DeviceCode)}/ports/observations",
+            new { configVersion = (int)revision, outputs = states.Select(s => new {
+                channel = s.GetProperty("channel").GetInt32(),
                 on = s.GetProperty("on").GetBoolean()
             }).ToArray() }, ct);
         // Preserve legacy RAS status for already mapped equipment. The inventory
         // itself stores every output, including unassigned ports.
-        foreach (var state in states)
+        foreach (var state in states.Where(s => bound.Contains(s.GetProperty("channel").GetInt32())))
         {
             try
             {
