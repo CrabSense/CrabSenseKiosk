@@ -55,6 +55,9 @@ jobs:
             dotnet build -c Release
           fi
 
+      - name: Edge V2 integration contract tests
+        run: dotnet test tests/CrabSenseKiosk.Tests/CrabSenseKiosk.Tests.csproj -c Release
+
       - name: End SonarCloud
         if: env.SONAR_TOKEN != '' && always()
         env:

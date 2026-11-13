@@ -52,7 +52,7 @@ public sealed class EdgeV2Worker : BackgroundService
         }
     }
 
-    private async Task CycleAsync(EdgeV2Device d, Uri cloud, CancellationToken ct)
+    internal async Task CycleAsync(EdgeV2Device d, Uri cloud, CancellationToken ct)
     {
         using var client = _clients.CreateClient("controller-inventory");
         client.Timeout = TimeSpan.FromSeconds(3);
