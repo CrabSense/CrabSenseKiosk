@@ -21,7 +21,7 @@ public sealed class ControllerPortsController : ControllerBase
     [RequestSizeLimit(65536)]
     public async Task<IActionResult> Report(string deviceCode, [FromBody] JsonElement manifest, CancellationToken ct)
     {
-        if (deviceCode.Length > 100 || !Regex.IsMatch(deviceCode, @"\A[A-Za-z0-9_.:-]+\z"))
+        if (deviceCode is "." or ".." || deviceCode.Length > 100 || !Regex.IsMatch(deviceCode, @"\A[A-Za-z0-9_.:-]+\z"))
             return BadRequest(new { message = "Invalid controller code." });
         var key = Request.Headers["X-Device-Key"].FirstOrDefault();
         if (string.IsNullOrWhiteSpace(key) || key.Length > 256)
@@ -29,7 +29,10 @@ public sealed class ControllerPortsController : ControllerBase
         if (manifest.ValueKind != JsonValueKind.Object)
             return BadRequest(new { message = "Manifest must be an object." });
         if (!Uri.TryCreate(_options.BackendUrl.TrimEnd('/') + "/", UriKind.Absolute, out var backend)
-            || backend.Scheme is not ("http" or "https"))
+            || backend.Scheme is not ("http" or "https")
+            || !string.IsNullOrEmpty(backend.UserInfo) || !string.IsNullOrEmpty(backend.Query)
+            || !string.IsNullOrEmpty(backend.Fragment)
+            || (backend.Scheme == "http" && !backend.IsLoopback))
             return StatusCode(503, new { message = "Backend not configured." });
 
         try
@@ -40,7 +43,7 @@ public sealed class ControllerPortsController : ControllerBase
                 Content = JsonContent.Create(manifest)
             };
             request.Headers.Add("X-Device-Key", key);
-            using var client = _clients.CreateClient();
+            using var client = _clients.CreateClient("controller-inventory");
             client.Timeout = TimeSpan.FromSeconds(8);
             using var response = await client.SendAsync(request, ct);
             var body = await response.Content.ReadAsStringAsync(ct);

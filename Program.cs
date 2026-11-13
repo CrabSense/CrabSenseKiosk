@@ -25,6 +25,9 @@ try
     builder.Services.AddControllers();
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddHttpClient();
+    // Do not forward a device credential through an HTTP redirect.
+    builder.Services.AddHttpClient("controller-inventory")
+        .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
     builder.Services.Configure<EdgeGatewayOptions>(
         builder.Configuration.GetSection(EdgeGatewayOptions.SectionName));
     var kioskSecretFile = Path.Combine(builder.Environment.ContentRootPath, "kiosk-secret.txt");
