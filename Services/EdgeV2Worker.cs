@@ -75,6 +75,7 @@ public sealed class EdgeV2Worker : BackgroundService
         var heartbeat = await LocalAsync(client, d, Envelope(d, "heartbeat", 5), ct);
         if (!heartbeat.GetProperty("success").GetBoolean()) throw new InvalidOperationException("Heartbeat rejected.");
 
+        var latest = heartbeat;
         var pending = await CloudAsync(client, cloud, d, HttpMethod.Get,
             $"api/edge/commands/pending?deviceCode={Uri.EscapeDataString(d.DeviceCode)}", null, ct);
         foreach (var cmd in pending.GetProperty("data").EnumerateArray().OrderBy(x => x.GetProperty("commandSequence").GetInt64()))
@@ -117,9 +118,9 @@ public sealed class EdgeV2Worker : BackgroundService
                 throw new InvalidOperationException("Command response mismatch.");
             await AckAsync(client, cloud, d, id, attempt, result.GetProperty("success").GetBoolean(),
                 result.GetProperty("message").GetString() ?? "", ct);
-            await ReportStatesAsync(client, cloud, d, result, channels, ct);
+            if (result.TryGetProperty("outputs", out _)) latest = result;
         }
-        await ReportStatesAsync(client, cloud, d, heartbeat, channels, ct);
+        await ReportStatesAsync(client, cloud, d, latest, channels, revision, ct);
     }
 
     private static Dictionary<string, object> Envelope(EdgeV2Device d, string kind, int seconds) => new()
@@ -173,11 +174,19 @@ public sealed class EdgeV2Worker : BackgroundService
             new { status = success ? "acknowledged" : "failed", deliveryAttemptId = attempt, message }, ct);
 
     private async Task ReportStatesAsync(HttpClient client, Uri cloud, EdgeV2Device d, JsonElement result,
-        HashSet<int> channels, CancellationToken ct)
+        HashSet<int> channels, long revision, CancellationToken ct)
     {
         var states = result.GetProperty("outputs").EnumerateArray().ToArray();
         if (states.Length != channels.Count || !states.Select(s => s.GetProperty("channel").GetInt32()).ToHashSet().SetEquals(channels))
             throw new InvalidOperationException("Invalid observed channels.");
+        await CloudAsync(client, cloud, d, HttpMethod.Put,
+            $"api/controllers/{Uri.EscapeDataString(d.DeviceCode)}/ports/observations",
+            new { revision, outputs = states.Select(s => new {
+                channel = s.GetProperty("channel").GetInt32().ToString(System.Globalization.CultureInfo.InvariantCulture),
+                on = s.GetProperty("on").GetBoolean()
+            }).ToArray() }, ct);
+        // Preserve legacy RAS status for already mapped equipment. The inventory
+        // itself stores every output, including unassigned ports.
         foreach (var state in states)
         {
             try
@@ -215,6 +224,7 @@ public sealed class EdgeV2Worker : BackgroundService
     private static bool Valid(EdgeV2Device d)
     {
         if (d.DeviceCode.Length > 100 || d.DeviceCode is "." or ".." || string.IsNullOrWhiteSpace(d.DeviceKey)
+            || !System.Text.RegularExpressions.Regex.IsMatch(d.DeviceCode, @"\A[A-Za-z0-9_.:-]+\z")
             || d.LocalKey.Length != 64 || d.LocalKey.Any(c => !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
             || !IPAddress.TryParse(d.LocalIp, out var ip) || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork
             || ip.ToString() != d.LocalIp) return false;

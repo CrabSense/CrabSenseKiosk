@@ -21,3 +21,5 @@ Do not run the old reference Python bridge at the same time for these devices.
 ON is still disabled in RC2 and BE deployment lock must remain enabled until
 hardware tests. No physical load detection is claimed. Test on isolated LAN,
 with loads disconnected, then validate real interlocks before any actuation.
+
+The worker records the latest signed output snapshot through PUT /api/controllers/{deviceCode}/ports/observations, including unbound channels, and updates existing RAS observations separately. A GPIO state is not proof that mains current flows or a pump operates.
