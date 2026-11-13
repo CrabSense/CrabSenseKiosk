@@ -75,6 +75,7 @@ try
     builder.Services.AddScoped<IAlertService, AlertService>();
     builder.Services.AddSingleton<ITelemetryService, TelemetryService>();
     builder.Services.AddSingleton<IControllerRegistry, ControllerRegistry>();
+    builder.Services.AddSingleton<ControllerEndpointRegistry>();
     builder.Services.AddHostedService<EdgeCommandWorker>();
     builder.Services.AddHostedService<EdgeV2Worker>();
 

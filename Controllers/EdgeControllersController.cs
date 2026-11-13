@@ -13,17 +13,20 @@ public sealed class EdgeControllersController : ControllerBase
     private readonly IHttpClientFactory _http;
     private readonly EdgeGatewayOptions _options;
     private readonly ILogger<EdgeControllersController> _logger;
+    private readonly ControllerEndpointRegistry? _endpoints;
 
     public EdgeControllersController(
         IControllerRegistry registry,
         IHttpClientFactory http,
         IOptions<EdgeGatewayOptions> options,
-        ILogger<EdgeControllersController> logger)
+        ILogger<EdgeControllersController> logger,
+        ControllerEndpointRegistry? endpoints = null)
     {
         _registry = registry;
         _http = http;
         _options = options.Value;
         _logger = logger;
+        _endpoints = endpoints;
     }
 
     [HttpPost("/api/controllers/register")]
@@ -38,6 +41,7 @@ public sealed class EdgeControllersController : ControllerBase
         {
             if (!_registry.IsAccepted(code) && !_registry.IsBlocked(code))
                 _registry.Set(code, "Pending");
+            if (_registry.IsAccepted(code)) _endpoints?.Record(code, HttpContext.Connection.RemoteIpAddress);
             return StatusCode(StatusCodes.Status201Created, new
             {
                 ok = true,
@@ -47,6 +51,7 @@ public sealed class EdgeControllersController : ControllerBase
         }
 
         _registry.Set(code, reported.EdgeState);
+        if (_registry.IsAccepted(code)) _endpoints?.Record(code, HttpContext.Connection.RemoteIpAddress);
         return StatusCode(StatusCodes.Status201Created, new
         {
             ok = true,

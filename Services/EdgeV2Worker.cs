@@ -21,9 +21,11 @@ public sealed class EdgeV2Worker : BackgroundService
     private readonly IHttpClientFactory _clients;
     private readonly EdgeGatewayOptions _options;
     private readonly ILogger<EdgeV2Worker> _log;
+    private readonly ControllerEndpointRegistry? _endpoints;
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
-    public EdgeV2Worker(IHttpClientFactory clients, IOptions<EdgeGatewayOptions> options, ILogger<EdgeV2Worker> log)
-        => (_clients, _options, _log) = (clients, options.Value, log);
+    public EdgeV2Worker(IHttpClientFactory clients, IOptions<EdgeGatewayOptions> options, ILogger<EdgeV2Worker> log,
+        ControllerEndpointRegistry? endpoints = null)
+        => (_clients, _options, _log, _endpoints) = (clients, options.Value, log, endpoints);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -43,11 +45,22 @@ public sealed class EdgeV2Worker : BackgroundService
             _log.LogWarning("Edge V2 device {Code} not configured securely; disabled.", d.DeviceCode);
             return;
         }
+        string? lastVerified = null;
         while (!ct.IsCancellationRequested)
         {
-            try { await CycleAsync(d, cloud, ct); }
+            try
+            {
+                var address = !string.IsNullOrWhiteSpace(d.LocalIp) ? d.LocalIp
+                    : lastVerified ?? _endpoints?.Candidate(d.DeviceCode);
+                if (address is not null && ControllerEndpointRegistry.IsPrivate(address))
+                {
+                    var target = new EdgeV2Device { DeviceCode = d.DeviceCode, DeviceKey = d.DeviceKey, LocalKey = d.LocalKey, LocalIp = address };
+                    await CycleAsync(target, cloud, ct);
+                    lastVerified = address;
+                }
+            }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
-            catch (Exception ex) { _log.LogWarning("Edge V2 cycle failed for {Code}: {Type}", d.DeviceCode, ex.GetType().Name); }
+            catch (Exception ex) { lastVerified = null; _log.LogWarning("Edge V2 cycle failed for {Code}: {Type}", d.DeviceCode, ex.GetType().Name); }
             await Task.Delay(TimeSpan.FromSeconds(2), ct);
         }
     }
@@ -226,9 +239,7 @@ public sealed class EdgeV2Worker : BackgroundService
         if (d.DeviceCode.Length > 100 || d.DeviceCode is "." or ".." || string.IsNullOrWhiteSpace(d.DeviceKey)
             || !System.Text.RegularExpressions.Regex.IsMatch(d.DeviceCode, @"\A[A-Za-z0-9_.:-]+\z")
             || d.LocalKey.Length != 64 || d.LocalKey.Any(c => !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
-            || !IPAddress.TryParse(d.LocalIp, out var ip) || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork
-            || ip.ToString() != d.LocalIp) return false;
-        var b = ip.GetAddressBytes();
-        return b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168);
+            || (!string.IsNullOrWhiteSpace(d.LocalIp) && !ControllerEndpointRegistry.IsPrivate(d.LocalIp))) return false;
+        return true;
     }
 }
