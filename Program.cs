@@ -76,6 +76,7 @@ try
     builder.Services.AddSingleton<ITelemetryService, TelemetryService>();
     builder.Services.AddSingleton<IControllerRegistry, ControllerRegistry>();
     builder.Services.AddHostedService<EdgeCommandWorker>();
+    builder.Services.AddHostedService<EdgeV2Worker>();
 
     var app = builder.Build();
 
