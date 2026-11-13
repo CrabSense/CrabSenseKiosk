@@ -73,7 +73,7 @@ public sealed class EdgeV2Worker : BackgroundService
         if (!inventory.GetProperty("success").GetBoolean()) throw new InvalidOperationException("Inventory rejected.");
         var manifest = inventory.GetProperty("manifest");
         var revision = manifest.GetProperty("revision").GetInt64();
-        if (revision < 1 || manifest.GetProperty("schemaVersion").GetInt32() != 1)
+        if (revision < 1 || revision > int.MaxValue || manifest.GetProperty("schemaVersion").GetInt32() != 1)
             throw new InvalidOperationException("Invalid manifest.");
         var channels = manifest.GetProperty("ports").EnumerateArray()
             .Where(p => p.GetProperty("present").GetBoolean() && p.GetProperty("direction").GetString() == "output"
@@ -83,8 +83,39 @@ public sealed class EdgeV2Worker : BackgroundService
         if (channels.Count == 0 || channels.Any(c => c < 1 || c > 16))
             throw new InvalidOperationException("Invalid channel inventory.");
 
-        await CloudAsync(client, cloud, d, HttpMethod.Put,
-            $"api/controllers/{Uri.EscapeDataString(d.DeviceCode)}/ports/manifest", manifest, ct);
+        // Translate only the verified signed descriptor to BE's canonical
+        // capability schema. Preserve the real GPIO, polarity and bus pins.
+        var observed = inventory.GetProperty("outputs").EnumerateArray()
+            .ToDictionary(x => x.GetProperty("channel").GetInt32(), x => x.GetProperty("on").GetBoolean());
+        if (!observed.Keys.ToHashSet().SetEquals(channels))
+            throw new InvalidOperationException("Signed inventory output state mismatch.");
+        var ports = manifest.GetProperty("ports").EnumerateArray().Select(p =>
+        {
+            var direction = p.GetProperty("direction").GetString();
+            var kind = p.GetProperty("kind").GetString();
+            var type = (direction, kind) switch
+            {
+                ("output", "ssr" or "relay") => "DIGITAL_OUTPUT",
+                ("input", "float") => "DIGITAL_INPUT",
+                ("bidirectional", "rs485") => "RS485",
+                _ => throw new InvalidOperationException("Unsupported port descriptor.")
+            };
+            int? channel = p.TryGetProperty("channel", out var ch)
+                ? int.Parse(ch.GetString()!, System.Globalization.CultureInfo.InvariantCulture) : null;
+            return new
+            {
+                portCode = p.GetProperty("portId").GetString(),
+                type, channel, gpio = p.GetProperty("gpio").GetInt32(),
+                secondaryGpio = p.TryGetProperty("secondaryGpio", out var sg) ? (int?)sg.GetInt32() : null,
+                activeLevel = p.TryGetProperty("activeLevel", out var level) ? level.GetString() : null,
+                sensorCode = p.TryGetProperty("sensorCode", out var sensor) ? sensor.GetString() : null,
+                on = type == "DIGITAL_OUTPUT" && channel.HasValue ? (bool?)observed[channel.Value] : null
+            };
+        }).ToArray();
+        await CloudAsync(client, cloud, d, HttpMethod.Post, "api/iot/controllers/capabilities",
+            new { deviceCode = d.DeviceCode, hardwareModel = manifest.GetProperty("hardwareModel").GetString(),
+                firmwareVersion = manifest.GetProperty("firmwareVersion").GetString(),
+                configVersion = (int)revision, ports }, ct);
         var heartbeat = await LocalAsync(client, d, Envelope(d, "heartbeat", 5), ct);
         if (!heartbeat.GetProperty("success").GetBoolean()) throw new InvalidOperationException("Heartbeat rejected.");
 
@@ -193,9 +224,9 @@ public sealed class EdgeV2Worker : BackgroundService
         if (states.Length != channels.Count || !states.Select(s => s.GetProperty("channel").GetInt32()).ToHashSet().SetEquals(channels))
             throw new InvalidOperationException("Invalid observed channels.");
         await CloudAsync(client, cloud, d, HttpMethod.Put,
-            $"api/controllers/{Uri.EscapeDataString(d.DeviceCode)}/ports/observations",
-            new { revision, outputs = states.Select(s => new {
-                channel = s.GetProperty("channel").GetInt32().ToString(System.Globalization.CultureInfo.InvariantCulture),
+            $"api/iot/controllers/{Uri.EscapeDataString(d.DeviceCode)}/ports/observations",
+            new { configVersion = (int)revision, outputs = states.Select(s => new {
+                channel = s.GetProperty("channel").GetInt32(),
                 on = s.GetProperty("on").GetBoolean()
             }).ToArray() }, ct);
         // Preserve legacy RAS status for already mapped equipment. The inventory

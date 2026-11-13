@@ -22,4 +22,6 @@ ON is still disabled in RC2 and BE deployment lock must remain enabled until
 hardware tests. No physical load detection is claimed. Test on isolated LAN,
 with loads disconnected, then validate real interlocks before any actuation.
 
-The worker records the latest signed output snapshot through PUT /api/controllers/{deviceCode}/ports/observations, including unbound channels, and updates existing RAS observations separately. A GPIO state is not proof that mains current flows or a pump operates.
+The worker records the latest signed output snapshot through PUT /api/iot/controllers/{deviceCode}/ports/observations, including unbound channels, and updates existing RAS observations separately. A GPIO state is not proof that mains current flows or a pump operates.
+
+The signed manifest is translated to the canonical POST /api/iot/controllers/capabilities DTO (configVersion, hardwareModel, portCode, type, GPIO/polarity/bus pins). No duplicate BE schema or legacy manifest proxy is required.

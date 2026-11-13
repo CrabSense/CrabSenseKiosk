@@ -72,9 +72,9 @@ public class EdgeV2WorkerTests
                     ["outputs"] = Enumerable.Range(1,5).Select(i => new { channel = i, on = false }).ToArray()
                 };
                 if (kind == "inventory")
-                    output["manifest"] = new { schemaVersion = 1, revision = 2,
-                        ports = Enumerable.Range(1,5).Select(i => new { portId = $"ssr-{i}", channel = i.ToString(),
-                            gpio = i + 10, kind = "ssr", direction = "output", discovery = "declared",
+                    output["manifest"] = new { schemaVersion = 1, revision = 2, hardwareModel = "ESP32-V1", firmwareVersion = "RC2",
+                        ports = Enumerable.Range(1,5).Select(i => new { portId = $"OUT-{i:00}", channel = i.ToString(),
+                            gpio = i + 10, kind = "ssr", direction = "output", activeLevel = "HIGH", discovery = "declared",
                             present = true, remoteControl = false }).ToArray() };
                 if (kind == "command")
                 {
@@ -93,11 +93,13 @@ public class EdgeV2WorkerTests
             }
             Assert.Equal("cloud-key", req.Headers.GetValues("X-Device-Key").Single());
             Assert.Equal("2", req.Headers.GetValues("X-Edge-Protocol").Single());
-            if (path.EndsWith("/ports/manifest"))
+            if (path.EndsWith("/capabilities"))
             {
-                Assert.Equal(HttpMethod.Put, req.Method);
+                Assert.Equal(HttpMethod.Post, req.Method);
                 using var doc = JsonDocument.Parse(body!);
                 Assert.Equal(5, doc.RootElement.GetProperty("ports").GetArrayLength());
+                Assert.Equal(2, doc.RootElement.GetProperty("configVersion").GetInt32());
+                Assert.Equal("DIGITAL_OUTPUT", doc.RootElement.GetProperty("ports")[4].GetProperty("type").GetString());
                 ManifestUploaded = true;
             }
             if (path.EndsWith("/pending"))
