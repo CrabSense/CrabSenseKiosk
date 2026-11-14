@@ -36,17 +36,15 @@ public sealed class EdgeControllersController : ControllerBase
             return BadRequest(new { ok = false, error = "controller_id is required" });
 
         var code = (body.DeviceCode ?? body.ControllerId)!.Trim();
-        var reported = await ReportAsync(code, body);
+        var reported = await ReportAsync(code, body, ct);
         if (reported is null)
         {
-            if (!_registry.IsAccepted(code) && !_registry.IsBlocked(code))
-                _registry.Set(code, "Pending");
-            if (_registry.IsAccepted(code)) _endpoints?.Record(code, HttpContext.Connection.RemoteIpAddress);
-            return StatusCode(StatusCodes.Status201Created, new
+            // Do not keep a cached approval after a failed cloud check.
+            if (!_registry.IsBlocked(code)) _registry.Set(code, "Pending");
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, new
             {
-                ok = true,
-                controller_id = code,
-                status = _registry.IsAccepted(code) ? "Approved" : "Pending"
+                ok = false, controller_id = code, status = "Pending",
+                error = "Cloud registration unavailable; approval not confirmed."
             });
         }
 
@@ -61,7 +59,7 @@ public sealed class EdgeControllersController : ControllerBase
         });
     }
 
-    private async Task<BeRegister?> ReportAsync(string code, RegisterBody body)
+    private async Task<BeRegister?> ReportAsync(string code, RegisterBody body, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(_options.KioskSecret) || string.IsNullOrWhiteSpace(_options.BackendUrl))
         {
@@ -87,14 +85,15 @@ public sealed class EdgeControllersController : ControllerBase
                 })
             };
             request.Headers.Add("X-Kiosk-Key", _options.KioskSecret);
-            using var response = await client.SendAsync(request, CancellationToken.None);
+            using var response = await client.SendAsync(request, ct);
             if (!response.IsSuccessStatusCode)
             {
                 _logger.LogWarning("BE register failed for {Code}: {Status}", code, response.StatusCode);
+                if ((int)response.StatusCode is 401 or 403 or 409) _registry.Set(code, "Rejected");
                 return null;
             }
 
-            var envelope = await response.Content.ReadFromJsonAsync<BeEnvelope>(CancellationToken.None);
+            var envelope = await response.Content.ReadFromJsonAsync<BeEnvelope>(ct);
             return envelope?.Data;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
