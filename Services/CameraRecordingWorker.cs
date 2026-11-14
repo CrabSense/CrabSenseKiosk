@@ -112,9 +112,14 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
         }
         catch
         {
-            if(started&&!captured&&!ct.IsCancellationRequested)
+            if(!captured&&!ct.IsCancellationRequested)
             {
-                try{await Send(client,HttpMethod.Put,path+"/finish",new{status="Failed",error="Recording or upload did not complete.",mediaAssetId=(Guid?)null},ct);}catch{ /* lease expires on server */ }
+                try
+                {
+                    if(started) await Send(client,HttpMethod.Put,path+"/finish",new{status="Failed",error="Recording did not complete.",mediaAssetId=(Guid?)null},ct);
+                    else await Send(client,HttpMethod.Post,root+"failures",new{executionId=id,scheduleId=effective.ScheduleId,scheduleVersion=effective.ScheduleVersion,error="Camera source or FFmpeg capture failed before video was confirmed."},ct);
+                }
+                catch{ /* server lease expires if notification cannot be delivered */ }
             }
             throw;
         }
@@ -154,6 +159,6 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
             content.Headers.ContentType=new("video/mp4");body.Add(content,"file",pending.ExecutionId.ToString("N")+".mp4");
             using var upload=await client.PostAsync(path+"/video",body,ct);upload.EnsureSuccessStatusCode();
         }
-        File.Delete(stem+".mp4");File.Delete(stem+".json");
+        File.Delete(stem+".json");File.Delete(stem+".mp4");
     }
 }
