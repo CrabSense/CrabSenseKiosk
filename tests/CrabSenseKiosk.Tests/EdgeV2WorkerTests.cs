@@ -38,6 +38,46 @@ public class EdgeV2WorkerTests
         if (!badSignature) Assert.True(transport.ObservationsUploaded);
     }
 
+    [Theory]
+    [InlineData(false, 1, 1)]
+    [InlineData(true, 0, 0)]
+    public async Task SensorCycle_RequiresSignedFreshMeasurement(bool invalidSignature,int expectedWrites,int expectedAcks)
+    {
+        var transport=new SensorFake(invalidSignature);
+        var worker=new EdgeV2Worker(new Factory(transport),Options.Create(new EdgeGatewayOptions()),NullLogger<EdgeV2Worker>.Instance);
+        using var client=new HttpClient(transport,disposeHandler:false);
+        await worker.SensorCycleAsync(client,new Uri("https://cloud.example/"),Device,2,default);
+        Assert.Equal(expectedWrites,transport.Writes);
+        Assert.Equal(expectedAcks,transport.Acks);
+    }
+    private sealed class SensorFake(bool invalidSignature):HttpMessageHandler
+    {
+        private readonly Guid id=Guid.NewGuid();
+        public int Writes,Acks;
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage req,CancellationToken ct)
+        {
+            var path=req.RequestUri!.AbsolutePath;
+            var body=req.Content is null?null:await req.Content.ReadAsByteArrayAsync(ct);
+            if(req.RequestUri.Host==Device.LocalIp)
+            {
+                using var json=JsonDocument.Parse(body!);var e=json.RootElement;
+                Assert.Equal("sensor-read",e.GetProperty("kind").GetString());
+                Assert.Equal("IN-01",e.GetProperty("portCode").GetString());
+                var bytes=JsonSerializer.SerializeToUtf8Bytes(new {success=true,protocol=2,deviceCode=Device.DeviceCode,
+                    nonce=e.GetProperty("nonce").GetString(),sensorCode="float_1",portCode="IN-01",unit="state",value=1,measuredEpoch=DateTimeOffset.UtcNow.ToUnixTimeSeconds()});
+                var res=new HttpResponseMessage(HttpStatusCode.OK){Content=new ByteArrayContent(bytes)};
+                res.Headers.Add("X-Kiosk-Signature",invalidSignature?new string('0',64):Convert.ToHexString(HMACSHA256.HashData(Encoding.ASCII.GetBytes(Key),bytes)).ToLowerInvariant());
+                return res;
+            }
+            if(path.EndsWith("/configuration"))return Response(new{success=true,data=new[]{new{id,sensorCode="float_1",portCode="IN-01",unit="state",isActive=true,configurationVersion=1,samplingIntervalSeconds=10}}});
+            if(path.EndsWith("/pending"))return Response(new{success=true,data=Array.Empty<object>()});
+            if(path.EndsWith("/sensor-data")){Writes++;using var json=JsonDocument.Parse(body!);Assert.Equal(1,json.RootElement.GetProperty("value").GetInt32());}
+            if(path.EndsWith("/configuration/ack"))Acks++;
+            return Response(new{success=true});
+        }
+        private static HttpResponseMessage Response(object data)=>new(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(data),Encoding.UTF8,"application/json")};
+    }
+
     private sealed class Factory(HttpMessageHandler handler) : IHttpClientFactory
     {
         public HttpClient CreateClient(string name) => new(handler, disposeHandler: false);

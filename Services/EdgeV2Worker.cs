@@ -93,19 +93,13 @@ public sealed partial class EdgeV2Worker : BackgroundService
         var bound = data.GetProperty("boundOutputChannels").EnumerateArray()
             .Select(x => x.GetInt32()).ToHashSet();
         if (!bound.IsSubsetOf(channels)) throw new InvalidOperationException("Invalid cloud bindings.");
-        // Read-only diagnostics stay available even when relay control is locked.
-        if (heartbeat.TryGetProperty("sensorReadSupported", out var supported) && supported.ValueKind == JsonValueKind.True)
-        {
-            try { await SensorCycleAsync(client, cloud, d, revision, ct); }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-            catch (Exception ex) { _log.LogWarning("Sensor cycle failed for {Code}: {Type}", d.DeviceCode, ex.GetType().Name); }
-        }
         // Discovery must still work while live control is disabled or NVS
         // sequence storage is unsafe. Do not even lease commands in this state.
         if (data.GetProperty("hardwareControlDisabled").GetBoolean()
             || !heartbeat.TryGetProperty("commandStorageReady", out var ready) || !ready.GetBoolean())
         {
             await ReportStatesAsync(client, cloud, d, heartbeat, channels, bound, revision, ct);
+            await ReadSensorsAsync();
             return;
         }
         var latest = heartbeat;
@@ -155,6 +149,22 @@ public sealed partial class EdgeV2Worker : BackgroundService
             if (result.TryGetProperty("outputs", out _)) latest = result;
         }
         await ReportStatesAsync(client, cloud, d, latest, channels, bound, revision, ct);
+        await ReadSensorsAsync();
+
+        async Task ReadSensorsAsync()
+        {
+        // Read-only diagnostics stay available even when relay control is locked.
+        if (heartbeat.TryGetProperty("sensorReadSupported", out var supported) && supported.ValueKind == JsonValueKind.True)
+        {
+            try {
+                using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                budget.CancelAfter(TimeSpan.FromSeconds(4));
+                await SensorCycleAsync(client, cloud, d, revision, budget.Token);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex) { _log.LogWarning("Sensor cycle failed for {Code}: {Type}", d.DeviceCode, ex.GetType().Name); }
+        }
+        }
     }
 
     private static Dictionary<string, object> Envelope(EdgeV2Device d, string kind, int seconds) => new()

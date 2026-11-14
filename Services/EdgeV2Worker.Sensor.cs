@@ -52,7 +52,7 @@ public sealed partial class EdgeV2Worker
             _sensorSchedule.TryRemove(key, out _);
         var now = DateTimeOffset.UtcNow;
         // Process oldest due samples first, bounded to avoid starving the heartbeat.
-        foreach (var sensor in configs.OrderBy(s => _sensorSchedule.TryGetValue((device.DeviceCode, s.GetProperty("id").GetGuid()), out var q)
+        foreach (var sensor in configs.Where(s=>s.GetProperty("isActive").GetBoolean()).OrderBy(s => _sensorSchedule.TryGetValue((device.DeviceCode, s.GetProperty("id").GetGuid()), out var q)
             ? q.Due : DateTimeOffset.MinValue).Take(64))
         {
             ct.ThrowIfCancellationRequested();
