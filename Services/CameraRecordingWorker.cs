@@ -36,18 +36,45 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
         var folder=Path.Combine(config["CameraRecording:SpoolDirectory"]??Path.Combine(AppContext.BaseDirectory,"recording-spool"),camera.Id.ToString("N"));
         Directory.CreateDirectory(folder);
         if(!OperatingSystem.IsWindows()) File.SetUnixFileMode(folder,UnixFileMode.UserRead|UnixFileMode.UserWrite|UnixFileMode.UserExecute);
+        using var stop=CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var upload=UploadLoop(client,root,camera,folder,stop.Token);
+        var maxPending=Math.Clamp(config.GetValue("CameraRecording:MaxPendingClips",8),1,32);
+        try
+        {
+            while(!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    // A bounded private spool decouples capture from slow media uploads.
+                    // Backpressure stops new captures instead of discarding completed clips.
+                    if(Directory.EnumerateFiles(folder,"*.json").Take(maxPending).Count()>=maxPending)
+                    {await Task.Delay(2000,ct);continue;}
+                    var effective=await Get<Effective>(client,root+"configuration",ct);
+                    if(effective.ShouldRecord&&effective.ScheduleId.HasValue)
+                    {
+                        await Record(client,root,camera,effective,folder,ct);
+                        continue;
+                    }
+                }
+                catch(OperationCanceledException) when(ct.IsCancellationRequested){break;}
+                catch(Exception ex){logger.LogWarning("Camera {CameraId} recording attempt failed ({ErrorType}).",camera.Id,ex.GetType().Name);}
+                await Task.Delay(TimeSpan.FromSeconds(5),ct);
+            }
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            try{await upload;}catch(OperationCanceledException) when(stop.IsCancellationRequested){}
+        }
+    }
+    private async Task UploadLoop(HttpClient client,string root,Camera camera,string folder,CancellationToken ct)
+    {
         while(!ct.IsCancellationRequested)
         {
-            try
-            {
-                await Recover(client,root,camera,folder,ct);
-                var effective=await Get<Effective>(client,root+"configuration",ct);
-                if(effective.ShouldRecord&&effective.ScheduleId.HasValue)
-                    await Record(client,root,camera,effective,folder,ct);
-            }
+            try{await Recover(client,root,camera,folder,ct);}
             catch(OperationCanceledException) when(ct.IsCancellationRequested){break;}
-            catch(Exception ex){logger.LogWarning("Camera {CameraId} recording attempt failed ({ErrorType}).",camera.Id,ex.GetType().Name);}
-            await Task.Delay(TimeSpan.FromSeconds(5),ct);
+            catch(Exception ex){logger.LogWarning("Camera {CameraId} upload pending ({ErrorType}).",camera.Id,ex.GetType().Name);}
+            await Task.Delay(TimeSpan.FromSeconds(2),ct);
         }
     }
     private static async Task<T> Get<T>(HttpClient c,string path,CancellationToken ct)
@@ -64,9 +91,7 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
     private async Task Record(HttpClient client,string root,Camera camera,Effective effective,string folder,CancellationToken ct)
     {
         var source=camera.Source??effective.StreamUrl;
-        if(!camera.Synthetic&&(!Uri.TryCreate(source,UriKind.Absolute,out var uri)||
-            uri.Scheme is not ("rtsp" or "rtsps" or "http" or "https")))
-            throw new InvalidOperationException("Camera source not configured.");
+
         var id=Guid.NewGuid();
         var file=Path.Combine(folder,id.ToString("N")+".mp4");
         var journal=Path.Combine(folder,id.ToString("N")+".json");
@@ -77,13 +102,15 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
         var args=process.StartInfo.ArgumentList;
         foreach(var a in new[]{"-nostdin","-hide_banner","-loglevel","error","-y"})args.Add(a);
         if(camera.Synthetic){foreach(var a in new[]{"-re","-f","lavfi","-i","testsrc2=size=640x360:rate=15"})args.Add(a);}
-        else {if(source!.StartsWith("rtsp",StringComparison.OrdinalIgnoreCase)){args.Add("-rtsp_transport");args.Add("tcp");}args.Add("-i");args.Add(source);}
+        else {if((source??"").StartsWith("rtsp",StringComparison.OrdinalIgnoreCase)){args.Add("-rtsp_transport");args.Add("tcp");}args.Add("-i");args.Add(source??"");}
         var seconds=Math.Clamp(config.GetValue("CameraRecording:SegmentSeconds",20),3,20);
         var height=effective.VideoQuality switch {"1080p"=>1080,"720p"=>720,"480p"=>480,_=>0};
         if(height>0){args.Add("-vf");args.Add($"scale=-2:{height}");}
         foreach(var a in new[]{"-t",seconds.ToString(),"-an","-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p","-r",Math.Clamp(effective.Fps??15,1,120).ToString(),"-fs","45000000","-movflags","+frag_keyframe+empty_moov","-g","15",file})args.Add(a);
         try
         {
+            if(!camera.Synthetic&&(!Uri.TryCreate(source,UriKind.Absolute,out var uri)||uri.Scheme is not ("rtsp" or "rtsps" or "http" or "https")))
+                throw new InvalidOperationException("Camera source not configured.");
             if(!process.Start())throw new InvalidOperationException("FFmpeg did not start.");
             var stderr=process.StandardError.ReadToEndAsync(ct);var stdout=process.StandardOutput.ReadToEndAsync(ct);
             var deadline=DateTime.UtcNow.AddSeconds(seconds+15);var heartbeat=DateTime.UtcNow;
@@ -104,11 +131,11 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
                 throw new InvalidOperationException("FFmpeg failed or produced no video.");
             await stderr;await stdout;
             if(!started){await Send(client,HttpMethod.Post,root+"executions",new{executionId=id,scheduleId=effective.ScheduleId,scheduleVersion=effective.ScheduleVersion},ct);started=true;}
-            // Persist a private retry journal before calling the network. One pending clip per camera
-            // bounds disk growth and survives a process restart or an ambiguous upload response.
+            // Persist the completed file before network operations. Release the capture lease
+            // before publishing the journal to the independent upload loop.
             await File.WriteAllTextAsync(journal+".tmp",JsonSerializer.Serialize(new Pending(camera.Id,id)),ct);
             File.Move(journal+".tmp",journal,overwrite:true);captured=true;
-            await UploadPending(client,root,camera,folder,new Pending(camera.Id,id),ct);
+            await Send(client,HttpMethod.Post,path+"/captured",new{},ct);
         }
         catch
         {
