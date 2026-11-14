@@ -7,3 +7,7 @@ BE: CameraRecording__AgentKeys__<camera-guid>=<test-key>
 Kiosk: CameraRecording__Enabled=true; CameraRecording__BackendUrl=http://127.0.0.1:5080; CameraRecording__Cameras__0__DeviceId=<camera-guid>; CameraRecording__Cameras__0__AgentKey=<test-key>; CameraRecording__Cameras__0__Synthetic=true; CameraRecording__SegmentSeconds=5; CameraRecording__MaxPendingClips=8.
 
 Start BE and Kiosk, verify a completed execution and playable private MP4 in recording history. Interrupt media storage and verify journals remain in the per-camera spool; restore storage and verify retry, then pause schedule and verify no new clips. Check invalid key, stale revision, and a bad FFmpeg executable for failure reporting. The bounded capture/upload pipeline still restarts FFmpeg for each segment; it is not frame-gap-free continuous recording. Do not claim lossless 24/7 capture.
+
+## Managed Kiosk provisioning
+
+For managed recording use the existing kiosk-secret.txt (or EdgeGateway__KioskSecret) provisioned through the Kiosk redemption API. Set CameraRecording__Enabled=true and CameraRecording__AutoDiscover=true. Assign the camera to that Kiosk in System Admin; its farming area must match. No per-camera key is required. The worker refreshes assignments and reports pending clip count. A local test override may set CameraRecording__Cameras__0__DeviceId and __Synthetic=true with loopback BE. Disabling assignment prevents both Kiosk and legacy-key runtime access. Recovery after reassignment may need manual review of the previous Kiosk's spool; do not copy keys or video between areas.

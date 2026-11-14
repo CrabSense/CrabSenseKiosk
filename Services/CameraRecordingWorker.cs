@@ -1,28 +1,76 @@
 using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.Extensions.Options;
 
 namespace CrabSenseKiosk.Services;
 
 public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFactory factory,
-    ILogger<CameraRecordingWorker> logger) : BackgroundService
+    ILogger<CameraRecordingWorker> logger, IOptions<EdgeGatewayOptions> gateway) : BackgroundService
 {
     private sealed record Envelope<T>(bool Success,T? Data);
     private sealed record Effective(Guid? ScheduleId,int ScheduleVersion,bool ShouldRecord,string? StreamUrl,int? Fps,string? VideoQuality);
     private sealed record Lease(bool ShouldContinue);
-    private sealed record Camera(Guid Id,string Key,string? Source,bool Synthetic);
+    private sealed record Camera(Guid Id,string Key,string? Source,bool Synthetic,bool Managed=false);
+    private sealed record AssignedCamera(Guid DeviceId,int Version);
     private sealed record Pending(Guid DeviceId,Guid ExecutionId);
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if(!config.GetValue<bool>("CameraRecording:Enabled")) return;
-        var url=config["CameraRecording:BackendUrl"];
+        var url=config["CameraRecording:BackendUrl"]??gateway.Value.BackendUrl;
         if(!Uri.TryCreate(url,UriKind.Absolute,out var backend) ||
             (backend.Scheme!="https" && !(backend.Scheme=="http" && backend.IsLoopback)))
         { logger.LogWarning("Recording worker requires HTTPS backend (HTTP loopback allowed for tests).");return; }
         var cameras=config.GetSection("CameraRecording:Cameras").GetChildren().Select(c=>
             new Camera(Guid.TryParse(c["DeviceId"],out var id)?id:Guid.Empty,c["AgentKey"]??"",c["Source"],c.GetValue<bool>("Synthetic")))
-            .Where(c=>c.Id!=Guid.Empty&&c.Key.Length>=32).GroupBy(c=>c.Id).Select(g=>g.First()).ToArray();
-        await Task.WhenAll(cameras.Select(c=>Loop(backend,c,stoppingToken)));
+            .Where(c=>c.Id!=Guid.Empty).GroupBy(c=>c.Id).Select(g=>g.First()).ToArray();
+        var key=gateway.Value.KioskSecret;
+        if(config.GetValue("CameraRecording:AutoDiscover",true)&&!string.IsNullOrWhiteSpace(key))
+            await Discover(backend,key,cameras,stoppingToken);
+        else
+            await Task.WhenAll(cameras.Where(c=>c.Key.Length>=32).Select(c=>Loop(backend,c,stoppingToken)));
+    }
+    private async Task Discover(Uri backend,string key,Camera[] overrides,CancellationToken ct)
+    {
+        using var client=factory.CreateClient("camera-recording");
+        client.BaseAddress=new Uri(backend.ToString().TrimEnd('/')+"/");
+        client.Timeout=TimeSpan.FromSeconds(10);
+        client.DefaultRequestHeaders.Add("X-Kiosk-Key",key);
+        var active=new Dictionary<Guid,(int Version,CancellationTokenSource Stop,Task Task)>();
+        try
+        {
+            while(!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var assigned=await Get<AssignedCamera[]>(client,"api/cameras/recording-agents/assigned",ct);
+                    var current=assigned.ToDictionary(x=>x.DeviceId,x=>x.Version);
+                    foreach(var id in active.Keys.ToArray())
+                    {
+                        var task=active[id];
+                        if(current.TryGetValue(id,out var v)&&v==task.Version&&!task.Task.IsCompleted)continue;
+                        await task.Stop.CancelAsync();
+                        try{await task.Task;}catch(OperationCanceledException){}catch(Exception ex){logger.LogWarning("Camera worker stopped ({ErrorType}).",ex.GetType().Name);}
+                        task.Stop.Dispose();active.Remove(id);
+                    }
+                    foreach(var camera in assigned.Where(x=>!active.ContainsKey(x.DeviceId)))
+                    {
+                        var local=overrides.FirstOrDefault(x=>x.Id==camera.DeviceId);
+                        var stop=CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        active.Add(camera.DeviceId,(camera.Version,stop,Loop(backend,new Camera(camera.DeviceId,key,local?.Source,local?.Synthetic??false,true),stop.Token)));
+                    }
+                }
+                catch(OperationCanceledException) when(ct.IsCancellationRequested){break;}
+                catch(Exception ex){logger.LogWarning("Camera assignment refresh failed ({ErrorType}).",ex.GetType().Name);}
+                await Task.Delay(TimeSpan.FromSeconds(15),ct);
+            }
+        }
+        finally
+        {
+            foreach(var task in active.Values)await task.Stop.CancelAsync();
+            foreach(var task in active.Values)
+            {try{await task.Task;}catch(OperationCanceledException){}catch(Exception ex){logger.LogWarning("Camera worker shutdown ({ErrorType}).",ex.GetType().Name);}task.Stop.Dispose();}
+        }
     }
     private async Task Loop(Uri backend,Camera camera,CancellationToken ct)
     {
@@ -31,7 +79,7 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
         using var client=factory.CreateClient("camera-recording");
         client.BaseAddress=new Uri(backend.ToString().TrimEnd('/')+"/");
         client.Timeout=TimeSpan.FromSeconds(45);
-        client.DefaultRequestHeaders.Add("X-Camera-Agent-Key",camera.Key);
+        client.DefaultRequestHeaders.Add(camera.Managed?"X-Kiosk-Key":"X-Camera-Agent-Key",camera.Key);
         var root=$"api/cameras/{camera.Id:D}/recording-runtime/";
         var folder=Path.Combine(config["CameraRecording:SpoolDirectory"]??Path.Combine(AppContext.BaseDirectory,"recording-spool"),camera.Id.ToString("N"));
         Directory.CreateDirectory(folder);
@@ -39,6 +87,7 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
         using var stop=CancellationTokenSource.CreateLinkedTokenSource(ct);
         var upload=UploadLoop(client,root,camera,folder,stop.Token);
         var maxPending=Math.Clamp(config.GetValue("CameraRecording:MaxPendingClips",8),1,32);
+        var lastAgentHeartbeat=DateTime.MinValue;
         try
         {
             while(!ct.IsCancellationRequested)
@@ -47,7 +96,13 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
                 {
                     // A bounded private spool decouples capture from slow media uploads.
                     // Backpressure stops new captures instead of discarding completed clips.
-                    if(Directory.EnumerateFiles(folder,"*.json").Take(maxPending).Count()>=maxPending)
+                    var pending=Directory.EnumerateFiles(folder,"*.json").Take(maxPending).Count();
+                    if(camera.Managed&&DateTime.UtcNow>=lastAgentHeartbeat.AddSeconds(20))
+                    {
+                        await Send(client,HttpMethod.Post,$"api/cameras/recording-agents/{camera.Id:D}/heartbeat",new{workerVersion="recording-v1",pendingClips=pending},ct);
+                        lastAgentHeartbeat=DateTime.UtcNow;
+                    }
+                    if(pending>=maxPending)
                     {await Task.Delay(2000,ct);continue;}
                     var effective=await Get<Effective>(client,root+"configuration",ct);
                     if(effective.ShouldRecord&&effective.ScheduleId.HasValue)
