@@ -78,6 +78,8 @@ try
     builder.Services.AddSingleton<ControllerEndpointRegistry>();
     builder.Services.AddHostedService<EdgeCommandWorker>();
     builder.Services.AddHostedService<EdgeV2Worker>();
+    builder.Services.AddHttpClient("camera-recording").ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
+    builder.Services.AddHostedService<CameraRecordingWorker>();
 
     var app = builder.Build();
 
