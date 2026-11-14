@@ -16,7 +16,7 @@ public sealed class EdgeV2Device
     public string LocalKey { get; set; } = "";
 }
 
-public sealed class EdgeV2Worker : BackgroundService
+public sealed partial class EdgeV2Worker : BackgroundService
 {
     private readonly IHttpClientFactory _clients;
     private readonly EdgeGatewayOptions _options;
@@ -93,6 +93,13 @@ public sealed class EdgeV2Worker : BackgroundService
         var bound = data.GetProperty("boundOutputChannels").EnumerateArray()
             .Select(x => x.GetInt32()).ToHashSet();
         if (!bound.IsSubsetOf(channels)) throw new InvalidOperationException("Invalid cloud bindings.");
+        // Read-only diagnostics stay available even when relay control is locked.
+        if (heartbeat.TryGetProperty("sensorReadSupported", out var supported) && supported.ValueKind == JsonValueKind.True)
+        {
+            try { await SensorCycleAsync(client, cloud, d, revision, ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex) { _log.LogWarning("Sensor cycle failed for {Code}: {Type}", d.DeviceCode, ex.GetType().Name); }
+        }
         // Discovery must still work while live control is disabled or NVS
         // sequence storage is unsafe. Do not even lease commands in this state.
         if (data.GetProperty("hardwareControlDisabled").GetBoolean()
