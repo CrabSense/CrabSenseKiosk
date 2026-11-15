@@ -1,0 +1,7 @@
+# Edge monitoring evidence
+
+Deploy BE monitoring evidence migration before upgrading Kiosk. Provisioned kiosks keep their existing heartbeat and additionally report process CPU usage (normalized by logical cores), process working-set bytes, spool filesystem free/total bytes, software version and timestamps of successful controller sync, recording configuration check and upload-worker check. A timestamp is absent until a successful check; an upload check is not proof a clip was uploaded. Older BE returning 404 to monitoring remains compatible.
+
+Managed cameras report assignment version and FFmpeg frame evidence through the existing authenticated agent heartbeat. Idle probes decode one video frame at most once per minute with an eight-second deadline; scheduled capture reuses actual FFmpeg progress. Evidence is stale after three minutes. Synthetic frames are labelled Synthetic and cannot verify a physical camera. No camera URL or FFmpeg stderr is transmitted in monitoring. Maintenance disables new idle probes. Agent heartbeat runs independently of capture and upload.
+
+Test with local loopback synthetic recording, then an isolated physical camera: verified frame, disconnect stream with Kiosk still online, wait for failed/stale sample, restore stream, verify fresh frame. Test spool capacity and stale telemetry without touching relay outputs. Process CPU/RAM are not whole-host resource utilisation.
