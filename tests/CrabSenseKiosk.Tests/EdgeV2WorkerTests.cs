@@ -17,6 +17,20 @@ public class EdgeV2WorkerTests
         DeviceCode = "ESP-TEST", LocalIp = "192.168.1.4", DeviceKey = "cloud-key", LocalKey = Key
     };
 
+    [Fact]
+    public void MonitorManifest_OnlyCopiesValidSignedEvidence()
+    {
+        using var manifest=JsonDocument.Parse("""{"configVersion":2,"rssiDbm":-99,"ports":[]}""");
+        using var hb=JsonDocument.Parse("""{"commandStorageReady":false,"sensorReadSupported":true,"rssiDbm":-62,"freeHeapBytes":123456,"uptimeSeconds":-1}""");
+        var result=EdgeV2Worker.MonitorManifest(manifest.RootElement,hb.RootElement);
+        Assert.Equal(2,result["configVersion"].GetInt32());
+        Assert.False(result["commandStorageReady"].GetBoolean());
+        Assert.Equal(-62,result["rssiDbm"].GetInt32());
+        Assert.Equal(123456,result["freeHeapBytes"].GetInt32());
+        Assert.False(result.ContainsKey("uptimeSeconds"));
+        using var legacy=JsonDocument.Parse("{}");
+        Assert.False(EdgeV2Worker.MonitorManifest(manifest.RootElement,legacy.RootElement).ContainsKey("rssiDbm"));
+    }
     [Theory]
     [InlineData(false, false, 1, true)]
     [InlineData(true, false, 0, false)]
@@ -114,6 +128,7 @@ public class EdgeV2WorkerTests
                 if (kind == "heartbeat")
                 {
                     output["commandStorageReady"] = true;
+                    output["rssiDbm"] = -57;
                     output["capabilities"] = new { deviceCode = Device.DeviceCode, configVersion = 2,
                         hardwareModel = "ESP32-V1", firmwareVersion = "RC2",
                         ports = Enumerable.Range(1,5).Select(i => new { portCode = $"OUT-{i:00}",
@@ -141,6 +156,8 @@ public class EdgeV2WorkerTests
                 Assert.Equal(HttpMethod.Post, req.Method);
                 using var doc = JsonDocument.Parse(body!);
                 Assert.Equal(5, doc.RootElement.GetProperty("ports").GetArrayLength());
+                Assert.Equal(-57,doc.RootElement.GetProperty("rssiDbm").GetInt32());
+                Assert.True(doc.RootElement.GetProperty("commandStorageReady").GetBoolean());
                 Assert.Equal(2, doc.RootElement.GetProperty("configVersion").GetInt32());
                 Assert.Equal("DIGITAL_OUTPUT", doc.RootElement.GetProperty("ports")[4].GetProperty("type").GetString());
                 ManifestUploaded = true;
