@@ -78,6 +78,8 @@ try
     builder.Services.AddSingleton<ControllerEndpointRegistry>();
     builder.Services.AddHostedService<EdgeCommandWorker>();
     builder.Services.AddHostedService<EdgeV2Worker>();
+    builder.Services.AddHttpClient("kiosk-heartbeat").ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
+    builder.Services.AddHostedService<KioskHeartbeatWorker>();
     builder.Services.AddHttpClient("camera-recording").ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
     builder.Services.AddHostedService<CameraRecordingWorker>();
 
