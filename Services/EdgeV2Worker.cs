@@ -88,7 +88,7 @@ public sealed partial class EdgeV2Worker : BackgroundService
             || stateChannels.Length != channels.Count || !stateChannels.ToHashSet().SetEquals(channels))
             throw new InvalidOperationException("Signed capability/state mismatch.");
         var accepted = await CloudAsync(client, cloud, d, HttpMethod.Post,
-            "api/iot/controllers/capabilities", manifest, ct);
+            "api/iot/controllers/capabilities", MonitorManifest(manifest,heartbeat), ct);
         var data = accepted.GetProperty("data");
         if (data.GetProperty("configVersion").GetInt32() != revision)
             throw new InvalidOperationException("Cloud did not accept the signed revision.");
@@ -167,6 +167,23 @@ public sealed partial class EdgeV2Worker : BackgroundService
             catch (Exception ex) { _log.LogWarning("Sensor cycle failed for {Code}: {Type}", d.DeviceCode, ex.GetType().Name); }
         }
         }
+    }
+
+    // Only signed heartbeat values, never unauthenticated discovery or layout fields.
+    internal static Dictionary<string,JsonElement> MonitorManifest(JsonElement manifest,JsonElement heartbeat)
+    {
+        var report=JsonSerializer.Deserialize<Dictionary<string,JsonElement>>(manifest.GetRawText())!;
+        foreach(var field in new[]{"commandStorageReady","sensorReadSupported","rssiDbm","freeHeapBytes","uptimeSeconds"})
+        {
+            report.Remove(field);
+            if(!heartbeat.TryGetProperty(field,out var value))continue;
+            var valid=field is "commandStorageReady" or "sensorReadSupported"
+                ? value.ValueKind is JsonValueKind.True or JsonValueKind.False
+                : value.ValueKind==JsonValueKind.Number&&value.TryGetInt64(out var number)&&
+                  (field=="rssiDbm"?number is >=-127 and <=0:field=="freeHeapBytes"?number is >=0 and <=16777216:number is >=0 and <=315360000);
+            if(valid)report[field]=value.Clone();
+        }
+        return report;
     }
 
     private static Dictionary<string, object> Envelope(EdgeV2Device d, string kind, int seconds) => new()
