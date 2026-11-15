@@ -22,10 +22,11 @@ public sealed partial class EdgeV2Worker : BackgroundService
     private readonly EdgeGatewayOptions _options;
     private readonly ILogger<EdgeV2Worker> _log;
     private readonly ControllerEndpointRegistry? _endpoints;
+    private readonly KioskMonitoringMetrics? _metrics;
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     public EdgeV2Worker(IHttpClientFactory clients, IOptions<EdgeGatewayOptions> options, ILogger<EdgeV2Worker> log,
-        ControllerEndpointRegistry? endpoints = null)
-        => (_clients, _options, _log, _endpoints) = (clients, options.Value, log, endpoints);
+        ControllerEndpointRegistry? endpoints = null,KioskMonitoringMetrics? metrics=null)
+        => (_clients, _options, _log, _endpoints, _metrics) = (clients, options.Value, log, endpoints,metrics);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -56,6 +57,7 @@ public sealed partial class EdgeV2Worker : BackgroundService
                 {
                     var target = new EdgeV2Device { DeviceCode = d.DeviceCode, DeviceKey = d.DeviceKey, LocalKey = d.LocalKey, LocalIp = address };
                     await CycleAsync(target, cloud, ct);
+                    _metrics?.MarkEdgeSync();
                     lastVerified = address;
                 }
             }

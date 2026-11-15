@@ -77,6 +77,7 @@ try
     builder.Services.AddSingleton<IControllerRegistry, ControllerRegistry>();
     builder.Services.AddSingleton<ControllerEndpointRegistry>();
     builder.Services.AddHostedService<EdgeCommandWorker>();
+    builder.Services.AddSingleton<KioskMonitoringMetrics>();
     builder.Services.AddHostedService<EdgeV2Worker>();
     builder.Services.AddHttpClient("kiosk-heartbeat").ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
     builder.Services.AddHostedService<KioskHeartbeatWorker>();

@@ -6,12 +6,13 @@ using Microsoft.Extensions.Options;
 namespace CrabSenseKiosk.Services;
 
 public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFactory factory,
-    ILogger<CameraRecordingWorker> logger, IOptions<EdgeGatewayOptions> gateway) : BackgroundService
+    ILogger<CameraRecordingWorker> logger, IOptions<EdgeGatewayOptions> gateway,KioskMonitoringMetrics? metrics=null) : BackgroundService
 {
     private sealed record Envelope<T>(bool Success,T? Data);
-    private sealed record Effective(Guid? ScheduleId,int ScheduleVersion,bool ShouldRecord,string? StreamUrl,int? Fps,string? VideoQuality);
+    private sealed record Effective(Guid? ScheduleId,int ScheduleVersion,bool ShouldRecord,string? StreamUrl,int? Fps,string? VideoQuality,bool MonitorStream=false);
     private sealed record Lease(bool ShouldContinue);
-    private sealed record Camera(Guid Id,string Key,string? Source,bool Synthetic,bool Managed=false);
+    private sealed record Camera(Guid Id,string Key,string? Source,bool Synthetic,bool Managed=false,int AssignmentVersion=0);
+    private sealed record ProbeEvidence(string Status,DateTimeOffset ObservedAt);
     private sealed record AssignedCamera(Guid DeviceId,int Version);
     private sealed record Pending(Guid DeviceId,Guid ExecutionId);
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -57,7 +58,7 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
                     {
                         var local=overrides.FirstOrDefault(x=>x.Id==camera.DeviceId);
                         var stop=CancellationTokenSource.CreateLinkedTokenSource(ct);
-                        active.Add(camera.DeviceId,(camera.Version,stop,Loop(backend,new Camera(camera.DeviceId,key,local?.Source,local?.Synthetic??false,true),stop.Token)));
+                        active.Add(camera.DeviceId,(camera.Version,stop,Loop(backend,new Camera(camera.DeviceId,key,local?.Source,local?.Synthetic??false,true,camera.Version),stop.Token)));
                     }
                 }
                 catch(OperationCanceledException) when(ct.IsCancellationRequested){break;}
@@ -87,7 +88,8 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
         using var stop=CancellationTokenSource.CreateLinkedTokenSource(ct);
         var upload=UploadLoop(client,root,camera,folder,stop.Token);
         var maxPending=Math.Clamp(config.GetValue("CameraRecording:MaxPendingClips",8),1,32);
-        var lastAgentHeartbeat=DateTime.MinValue;
+        ProbeEvidence? probe=null;
+        var agentHeartbeat=camera.Managed?AgentLoop(client,camera,folder,maxPending,()=>Volatile.Read(ref probe),stop.Token):Task.CompletedTask;
         try
         {
             while(!ct.IsCancellationRequested)
@@ -97,19 +99,19 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
                     // A bounded private spool decouples capture from slow media uploads.
                     // Backpressure stops new captures instead of discarding completed clips.
                     var pending=Directory.EnumerateFiles(folder,"*.json").Take(maxPending).Count();
-                    if(camera.Managed&&DateTime.UtcNow>=lastAgentHeartbeat.AddSeconds(20))
-                    {
-                        await Send(client,HttpMethod.Post,$"api/cameras/recording-agents/{camera.Id:D}/heartbeat",new{workerVersion="recording-v1",pendingClips=pending},ct);
-                        lastAgentHeartbeat=DateTime.UtcNow;
-                    }
                     if(pending>=maxPending)
                     {await Task.Delay(2000,ct);continue;}
                     var effective=await Get<Effective>(client,root+"configuration",ct);
+                    metrics?.MarkRecordingCheck();
                     if(effective.ShouldRecord&&effective.ScheduleId.HasValue)
                     {
-                        await Record(client,root,camera,effective,folder,ct);
+                        await Record(client,root,camera,effective,folder,e=>Volatile.Write(ref probe,e),ct);
                         continue;
                     }
+                    var last=Volatile.Read(ref probe);
+                    var source=camera.Source??effective.StreamUrl;
+                    if(camera.Managed&&effective.MonitorStream&&(camera.Synthetic||!string.IsNullOrWhiteSpace(source))&&(last==null||DateTimeOffset.UtcNow-last.ObservedAt>=TimeSpan.FromSeconds(60)))
+                        Volatile.Write(ref probe,await ProbeAsync(camera,source,ct));
                 }
                 catch(OperationCanceledException) when(ct.IsCancellationRequested){break;}
                 catch(Exception ex){logger.LogWarning("Camera {CameraId} recording attempt failed ({ErrorType}).",camera.Id,ex.GetType().Name);}
@@ -119,14 +121,54 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
         finally
         {
             await stop.CancelAsync();
-            try{await upload;}catch(OperationCanceledException) when(stop.IsCancellationRequested){}
+            try{await Task.WhenAll(upload,agentHeartbeat);}catch(OperationCanceledException) when(stop.IsCancellationRequested){}
         }
+    }
+    private async Task AgentLoop(HttpClient client,Camera camera,string folder,int maxPending,Func<ProbeEvidence?> latest,CancellationToken ct)
+    {
+        while(!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var evidence=latest();if(evidence!=null&&DateTimeOffset.UtcNow-evidence.ObservedAt>TimeSpan.FromMinutes(5))evidence=null;
+                var pending=Directory.EnumerateFiles(folder,"*.json").Take(maxPending).Count();
+                await Send(client,HttpMethod.Post,$"api/cameras/recording-agents/{camera.Id:D}/heartbeat",new{workerVersion="recording-v2",pendingClips=pending,assignmentVersion=camera.AssignmentVersion,streamProbeStatus=evidence?.Status,streamProbedAt=evidence?.ObservedAt},ct);
+                await Task.Delay(TimeSpan.FromSeconds(20),ct);
+            }
+            catch(OperationCanceledException)when(ct.IsCancellationRequested){break;}
+            catch(Exception ex){logger.LogWarning("Camera {CameraId} agent heartbeat unavailable ({ErrorType}).",camera.Id,ex.GetType().Name);await Task.Delay(TimeSpan.FromSeconds(5),ct);}
+        }
+    }
+    internal static bool HasDecodedFrame(string progress)=>progress.Split('\n').Any(line=>line.StartsWith("frame=",StringComparison.Ordinal)&&int.TryParse(line.AsSpan(6).Trim(),out var n)&&n>0);
+    private async Task<ProbeEvidence> ProbeAsync(Camera camera,string? source,CancellationToken ct)
+    {
+        using var process=new Process{StartInfo=new ProcessStartInfo(config["CameraRecording:FfmpegPath"]??"ffmpeg")
+            {UseShellExecute=false,CreateNoWindow=true,RedirectStandardError=true,RedirectStandardOutput=true}};
+        var args=process.StartInfo.ArgumentList;
+        foreach(var a in new[]{"-nostdin","-hide_banner","-loglevel","error","-progress","pipe:1","-nostats"})args.Add(a);
+        if(camera.Synthetic){foreach(var a in new[]{"-f","lavfi","-i","testsrc2=size=160x120:rate=5"})args.Add(a);}
+        else{
+            if(!Uri.TryCreate(source,UriKind.Absolute,out var uri)||uri.Scheme is not ("rtsp" or "rtsps" or "http" or "https"))return new("Failed",DateTimeOffset.UtcNow);
+            if(uri.Scheme.StartsWith("rtsp",StringComparison.OrdinalIgnoreCase)){args.Add("-rtsp_transport");args.Add("tcp");}
+            args.Add("-i");args.Add(source!);
+        }
+        foreach(var a in new[]{"-map","0:v:0","-frames:v","1","-an","-f","null","-"})args.Add(a);
+        try{
+            if(!process.Start())return new("Failed",DateTimeOffset.UtcNow);
+            var stderr=process.StandardError.ReadToEndAsync(ct);var stdout=process.StandardOutput.ReadToEndAsync(ct);
+            using var timeout=CancellationTokenSource.CreateLinkedTokenSource(ct);timeout.CancelAfter(TimeSpan.FromSeconds(8));
+            await process.WaitForExitAsync(timeout.Token);
+            var progress=await stdout;await stderr;
+            return new(process.ExitCode==0&&HasDecodedFrame(progress)?camera.Synthetic?"Synthetic":"Verified":"Failed",DateTimeOffset.UtcNow);
+        }catch(OperationCanceledException)when(ct.IsCancellationRequested){throw;}
+        catch(Exception){return new("Failed",DateTimeOffset.UtcNow);}
+        finally{try{if(!process.HasExited){process.Kill(entireProcessTree:true);await process.WaitForExitAsync(CancellationToken.None);}}catch(InvalidOperationException){}}
     }
     private async Task UploadLoop(HttpClient client,string root,Camera camera,string folder,CancellationToken ct)
     {
         while(!ct.IsCancellationRequested)
         {
-            try{await Recover(client,root,camera,folder,ct);}
+            try{await Recover(client,root,camera,folder,ct);metrics?.MarkUploadCheck();}
             catch(OperationCanceledException) when(ct.IsCancellationRequested){break;}
             catch(Exception ex){logger.LogWarning("Camera {CameraId} upload pending ({ErrorType}).",camera.Id,ex.GetType().Name);}
             await Task.Delay(TimeSpan.FromSeconds(2),ct);
@@ -143,7 +185,7 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
         using var request=new HttpRequestMessage(method,path){Content=JsonContent.Create(value)};
         using var response=await c.SendAsync(request,ct);response.EnsureSuccessStatusCode();
     }
-    private async Task Record(HttpClient client,string root,Camera camera,Effective effective,string folder,CancellationToken ct)
+    private async Task Record(HttpClient client,string root,Camera camera,Effective effective,string folder,Action<ProbeEvidence> observe,CancellationToken ct)
     {
         var source=camera.Source??effective.StreamUrl;
 
@@ -155,7 +197,7 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
         using var process=new Process{StartInfo=new ProcessStartInfo(config["CameraRecording:FfmpegPath"]??"ffmpeg")
             {UseShellExecute=false,CreateNoWindow=true,RedirectStandardError=true,RedirectStandardOutput=true}};
         var args=process.StartInfo.ArgumentList;
-        foreach(var a in new[]{"-nostdin","-hide_banner","-loglevel","error","-y"})args.Add(a);
+        foreach(var a in new[]{"-nostdin","-hide_banner","-loglevel","error","-progress","pipe:1","-nostats","-y"})args.Add(a);
         if(camera.Synthetic){foreach(var a in new[]{"-re","-f","lavfi","-i","testsrc2=size=640x360:rate=15"})args.Add(a);}
         else {if((source??"").StartsWith("rtsp",StringComparison.OrdinalIgnoreCase)){args.Add("-rtsp_transport");args.Add("tcp");}args.Add("-i");args.Add(source??"");}
         var seconds=Math.Clamp(config.GetValue("CameraRecording:SegmentSeconds",20),3,20);
@@ -182,9 +224,9 @@ public sealed class CameraRecordingWorker(IConfiguration config, IHttpClientFact
                 }
                 await Task.Delay(500,ct);
             }
-            if(!process.HasExited||process.ExitCode!=0||!File.Exists(file)||new FileInfo(file).Length<=4096)
-                throw new InvalidOperationException("FFmpeg failed or produced no video.");
-            await stderr;await stdout;
+            if(!process.HasExited||process.ExitCode!=0||!File.Exists(file)||new FileInfo(file).Length<=4096){observe(new("Failed",DateTimeOffset.UtcNow));throw new InvalidOperationException("FFmpeg failed or produced no video.");}
+            await stderr;var progress=await stdout;
+            if(HasDecodedFrame(progress))observe(new(camera.Synthetic?"Synthetic":"Verified",DateTimeOffset.UtcNow));
             if(!started){await Send(client,HttpMethod.Post,root+"executions",new{executionId=id,scheduleId=effective.ScheduleId,scheduleVersion=effective.ScheduleVersion},ct);started=true;}
             // Persist the completed file before network operations. Release the capture lease
             // before publishing the journal to the independent upload loop.

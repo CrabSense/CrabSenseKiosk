@@ -26,6 +26,20 @@ public sealed class KioskHeartbeatTests
         using var handler=new Fake();var worker=new KioskHeartbeatWorker(new Factory(handler),Options.Create(new EdgeGatewayOptions{BackendUrl="https://cloud.example"}),NullLogger<KioskHeartbeatWorker>.Instance);
         Assert.Null(await worker.SendOnceAsync(default));Assert.Equal(0,handler.Calls);
     }
+    [Theory]
+    [InlineData("frame=0\nprogress=end",false)]
+    [InlineData("frame= 1\nprogress=end",true)]
+    [InlineData("progress=end",false)]
+    public void StreamEvidenceRequiresDecodedFrame(string progress,bool expected)=>Assert.Equal(expected,CameraRecordingWorker.HasDecodedFrame(progress));
+    [Fact]
+    public void ResourceSnapshotDoesNotInventWorkerTimestamps(){
+        var config=new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build();
+        var metrics=new KioskMonitoringMetrics(config);
+        var before=metrics.Snapshot();Assert.Null(before.EdgeSyncedAt);Assert.Null(before.RecordingCheckedAt);Assert.Null(before.UploadCheckedAt);
+        metrics.MarkEdgeSync();metrics.MarkRecordingCheck();metrics.MarkUploadCheck();
+        var after=metrics.Snapshot();Assert.NotNull(after.EdgeSyncedAt);Assert.NotNull(after.RecordingCheckedAt);Assert.NotNull(after.UploadCheckedAt);
+        Assert.True(after.ProcessMemoryBytes>=0);
+    }
     private sealed class Factory(HttpMessageHandler handler):IHttpClientFactory{public HttpClient CreateClient(string name)=>new(handler,disposeHandler:false);}
     private sealed class Fake:HttpMessageHandler{
         public int Calls;
