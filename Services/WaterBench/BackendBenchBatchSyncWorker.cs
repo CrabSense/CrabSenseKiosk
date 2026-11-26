@@ -16,7 +16,7 @@ internal static class BackendBenchBatchSync
         return new Uri(uri,"/api/edge/water-bench/batch-events");
     }
     internal static async Task<BenchBatchSyncOutcome> SendNext(HttpClient client,Uri endpoint,string secret,
-        BenchSyncQueue queue,CancellationToken ct,bool enableMedia=false)
+        BenchSyncQueue queue,CancellationToken ct,bool enableMedia=false,bool enableNh3=false)
     {
         if(endpoint!=Endpoint(endpoint.GetLeftPart(UriPartial.Authority))||
             string.IsNullOrWhiteSpace(secret)||secret.Length>4096||secret.Any(char.IsControl))
@@ -24,21 +24,24 @@ internal static class BackendBenchBatchSync
         var plan=queue.Scan();
         // Use the same worker for both routes; timeline events always take precedence.
         var next=plan.Ready.FirstOrDefault(x=>x.Kind=="batch")??
+            (enableNh3?plan.Ready.FirstOrDefault(x=>x.Kind=="nh3"):null)??
             (enableMedia?plan.Ready.FirstOrDefault(x=>x.Kind=="media"):null);
         if(next is null)return new(plan.InvalidFiles>0||plan.BlockedBatches>0?"queue_blocked":
-            plan.Pending>0?"waiting_for_media":"idle");
+            plan.Pending>0?(plan.Ready.Any(x=>x.Kind=="media")?"waiting_for_media":"waiting_for_nh3"):"idle");
         var now=DateTimeOffset.UtcNow;
-        bool media=next.Kind=="media";
-        queue.TransportStatus(media?"sending_media":"sending",attempt:now);
+        bool media=next.Kind=="media",nh3=next.Kind=="nh3";
+        queue.TransportStatus(media?"sending_media":nh3?"sending_nh3":"sending",attempt:now);
         try
         {
             var body=queue.Prepare(next);
-            if(!media&&(body is not BenchBatchEvent batch||batch.EventId!=next.EventId||batch.StationId!=next.StationId))
+            if(!media&&!nh3&&(body is not BenchBatchEvent batch||batch.EventId!=next.EventId||batch.StationId!=next.StationId)||
+                nh3&&(body is not Nh3EvidenceEvent n||n.EventId!=next.EventId||n.StationId!=next.StationId))
                 return new("local_evidence_invalid");
             var bytesToSend=JsonSerializer.SerializeToUtf8Bytes(body,body.GetType(),BenchMediaManifest.Json);
             if(bytesToSend.Length>(media?96*1024:8192))return new("local_evidence_invalid");
             // Fixed same-origin paths; never follow a response-supplied URL.
-            var target=media?new Uri(endpoint,"/api/edge/water-bench/media"):endpoint;
+            var target=media?new Uri(endpoint,"/api/edge/water-bench/media"):
+                nh3?new Uri(endpoint,"/api/edge/water-bench/nh3-evidence"):endpoint;
             using var request=new HttpRequestMessage(HttpMethod.Post,target);
             request.Headers.Add("X-Kiosk-Key",secret.Trim());
             request.Content=new ByteArrayContent(bytesToSend);
@@ -87,7 +90,7 @@ internal static class BackendBenchBatchSync
             {return new("invalid_receipt",status);}
             // Atomic create-only receipt. If the process dies before this write, resend same event ID.
             queue.Accept(next,receipt,DateTimeOffset.UtcNow);
-            queue.TransportStatus(media?"media_acknowledged":"acknowledged",receipt:DateTimeOffset.UtcNow,httpStatus:status);
+            queue.TransportStatus(media?"media_acknowledged":nh3?"nh3_acknowledged":"acknowledged",receipt:DateTimeOffset.UtcNow,httpStatus:status);
             return new("acknowledged",status,true);
         }
         catch(OperationCanceledException) when(ct.IsCancellationRequested){throw;}
@@ -118,10 +121,10 @@ public sealed class BackendBenchBatchSyncWorker(IHttpClientFactory clients,IOpti
                 else
                 {
                     using var client=clients.CreateClient("water-bench-batch-sync");
-                    var result=await BackendBenchBatchSync.SendNext(client,endpoint,secret,queue,ct,settings.EnableMediaSync);
+                    var result=await BackendBenchBatchSync.SendNext(client,endpoint,secret,queue,ct,settings.EnableMediaSync,settings.EnableNh3EvidenceSync);
                     if(!result.Acknowledged)queue.TransportStatus(result.State,httpStatus:result.HttpStatus);
                     delay=result.Acknowledged?TimeSpan.FromSeconds(1):
-                        result.State is "idle" or "waiting_for_media"?TimeSpan.FromSeconds(10):TimeSpan.FromSeconds(30);
+                        result.State is "idle" or "waiting_for_media" or "waiting_for_nh3"?TimeSpan.FromSeconds(10):TimeSpan.FromSeconds(30);
                 }
             }
             catch(OperationCanceledException)when(ct.IsCancellationRequested){break;}

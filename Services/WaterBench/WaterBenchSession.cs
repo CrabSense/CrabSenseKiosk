@@ -23,6 +23,7 @@ public sealed class WaterBenchSession
     private DateTimeOffset? _telemetryAt;
     private string? _activeBatch;
     private BatchObservationJournal? _timeline;
+    private Nh3EvidenceEvent? _nh3SampleEvent,_nh3ImageEvent;
     private bool _fault;
     private Guid _connection;
     private string? _error;
@@ -45,13 +46,13 @@ public sealed class WaterBenchSession
         (_options,_spool)=(options,spool);
         SyncQueue=new BenchSyncQueue(spool,options.BackendStationId);
     }
-    public object SyncStatus()=>SyncQueue.Snapshot(_options.Enabled&&_options.EnableBatchSync,_options.EnableMediaSync);
+    public object SyncStatus()=>SyncQueue.Snapshot(_options.Enabled&&_options.EnableBatchSync,_options.EnableMediaSync,_options.EnableNh3EvidenceSync);
 
     internal void Connected(Action<string> write)
     {
         lock(_gate)
         {
-            _connection=Guid.NewGuid(); _write=write; _timeline=null;
+            _connection=Guid.NewGuid(); _write=write; _timeline=null;_nh3SampleEvent=_nh3ImageEvent=null;
             _master=_slave=_batch=_clean=_sample=null; _telemetry=null; _telemetryAt=null;
             _activeBatch=null; _startPending=false; _boot=null; _clock=null; _helloNonce=Guid.Empty; _pending=null; _lastSequence=0; _batchAtMs=_cleanAtMs=_telemetryAtMs=0; _sessions.Clear(); _links.Clear(); _frames.Clear(); _saved.Clear(); _camera.Reset();
             // Reconnect never silently releases prior uncertain state.
@@ -204,7 +205,7 @@ public sealed class WaterBenchSession
                 _timeline=new BatchObservationJournal(_options.BackendStationId,_connection,_boot,_spool);
                 _timeline.Start(line,_pending is {Action:"manual" or "scheduled"} pending?pending.Id:null,utc);
             }
-            _activeBatch=p[2];_startPending=false;_sessions.Clear();_saved.Clear();_links.Clear();_frames.Clear();_camera.Reset();
+            _activeBatch=p[2];_startPending=false;_sample=null;_nh3SampleEvent=_nh3ImageEvent=null;_sessions.Clear();_saved.Clear();_links.Clear();_frames.Clear();_camera.Reset();
             Store("batch_start",line);return;
         }
         if(line.StartsWith("BATCH SESSION ",StringComparison.Ordinal))
@@ -247,12 +248,51 @@ public sealed class WaterBenchSession
         {
             var e=WireProtocol.Json(line[11..]);
             if(_sessions.TryGetValue("NH3",out var sid)&&e.GetProperty("session_id").GetString()==sid)
-            {_sample=e;Store("sample_evidence",new {sample=e,clock=SampleClock(e)});}
+            {
+                _sample=e;Store("sample_evidence",new {sample=e,clock=SampleClock(e)});
+                if(_options.BackendStationId!=Guid.Empty&&_activeBatch is not null&&_boot is not null&&Identified)
+                {
+                    var reading=Nh3EvidenceWire.Sample(e);
+                    if(_nh3SampleEvent is {} previous)
+                    {
+                        if(previous.SessionId!=sid||previous.Sample!=reading)
+                            throw new FormatException("Conflicting NH3 sample observation.");
+                    }
+                    else
+                    {
+                        var typed=new Nh3EvidenceEvent(_options.BackendStationId,Guid.NewGuid(),_connection,_boot,_activeBatch,sid,
+                            "sample",utc,_options.MasterHardwareId,_options.SlaveHardwareId,reading,
+                            ClockEstimate:Nh3EvidenceWire.Estimate(reading,_clock,_boot,now));
+                        Nh3EvidencePolicy.Validate(typed);_spool.Nh3Event(typed);_nh3SampleEvent=typed;
+                    }
+                }
+            }
             else Store("unassociated_sample_evidence",e);
             return;
         }
         if(line.StartsWith("NH3 IMAGE_LINK ",StringComparison.Ordinal))
-        {Store("nh3_image_link",WireProtocol.Json(line[15..]));return;}
+        {
+            var e=WireProtocol.Json(line[15..]);Store("nh3_image_link",e);
+            if(_options.BackendStationId!=Guid.Empty&&_activeBatch is not null&&_boot is not null&&Identified&&
+                _sessions.TryGetValue("NH3",out var sid)&&e.GetProperty("session_id").GetString()==sid)
+            {
+                var image=Nh3EvidenceWire.Image(e);uint id=checked((uint)image.CaptureId);
+                bool matched=(_links.TryGetValue(id,out var link)&&link.Analyte=="NH3"&&link.Session==sid)||
+                    (_saved.TryGetValue(id,out var saved)&&saved.Analyte=="NH3");
+                if(!matched)throw new FormatException("Unmatched NH3 image request.");
+                if(_nh3ImageEvent is {} previous)
+                {
+                    if(previous.SessionId!=sid||previous.Image!=image)throw new FormatException("Conflicting NH3 image observation.");
+                }
+                else
+                {
+                    var typed=new Nh3EvidenceEvent(_options.BackendStationId,Guid.NewGuid(),_connection,_boot,_activeBatch,sid,
+                        "image_link",utc,_options.MasterHardwareId,_options.SlaveHardwareId,Image:image);
+                    Nh3EvidencePolicy.Validate(typed);_spool.Nh3Event(typed);_nh3ImageEvent=typed;
+                }
+            }
+            return;
+        }
         if(line.StartsWith("link=",StringComparison.Ordinal))
         {
             _telemetry=line.Split(' ',StringSplitOptions.RemoveEmptyEntries).Select(p=>p.Split('=',2))
@@ -264,7 +304,7 @@ public sealed class WaterBenchSession
         if(line.StartsWith("BATCH RESET",StringComparison.Ordinal))
         {
             InterruptTimeline("reset_before_terminal_status");_timeline=null;
-            _activeBatch=null;_sessions.Clear();_links.Clear();_frames.Clear();_saved.Clear();_camera.Reset();Store("operator_event",line);return;
+            _activeBatch=null;_sample=null;_nh3SampleEvent=_nh3ImageEvent=null;_sessions.Clear();_links.Clear();_frames.Clear();_saved.Clear();_camera.Reset();Store("operator_event",line);return;
         }
         // Only a matching structured ACK may resolve a command. Human-readable REJECT is evidence only.
         if(line.StartsWith("BATCH FAULT",StringComparison.Ordinal)||line.StartsWith("CLEAN FAULT",StringComparison.Ordinal))

@@ -8,6 +8,7 @@ public sealed class WaterBenchOptions
     public bool UseBackendSchedule { get; set; }
     public bool EnableBatchSync { get; set; }
     public bool EnableMediaSync { get; set; }
+    public bool EnableNh3EvidenceSync { get; set; }
     public Guid BackendStationId { get; set; }
     public string MasterPort { get; set; } = "";
     public string SlavePort { get; set; } = "";
