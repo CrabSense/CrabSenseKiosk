@@ -27,6 +27,8 @@ public sealed class WaterBenchController : ControllerBase
     }
     [HttpGet("status")]
     public IActionResult Status()=>Allowed()?Ok(_session.Snapshot()):Unauthorized();
+    [HttpGet("sync/status")]
+    public IActionResult SyncStatus()=>Allowed()?Ok(_session.SyncStatus()):Unauthorized();
     [HttpGet("schedule")]
     public IActionResult Schedule()=>Allowed()?Ok(_schedule.Snapshot(DateTimeOffset.UtcNow)):Unauthorized();
     [HttpPut("schedule")]

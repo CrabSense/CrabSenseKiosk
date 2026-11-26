@@ -73,4 +73,4 @@ jobs:
         with:
           dotnet-version: "8.0.x"
       - name: WaterBench protocol and JPEG decode tests
-        run: dotnet test tests/CrabSenseKiosk.Tests/CrabSenseKiosk.Tests.csproj -c Release --filter "FullyQualifiedName~WaterBenchTests|FullyQualifiedName~BenchScheduleTests|FullyQualifiedName~GatewayAckTests|FullyQualifiedName~BackendBenchConfigurationTests|FullyQualifiedName~BatchObservationJournalTests|FullyQualifiedName~BenchMediaManifestTests"
+        run: dotnet test tests/CrabSenseKiosk.Tests/CrabSenseKiosk.Tests.csproj -c Release --filter "FullyQualifiedName~WaterBenchTests|FullyQualifiedName~BenchScheduleTests|FullyQualifiedName~GatewayAckTests|FullyQualifiedName~BackendBenchConfigurationTests|FullyQualifiedName~BatchObservationJournalTests|FullyQualifiedName~BenchMediaManifestTests|FullyQualifiedName~BenchSyncQueueTests"

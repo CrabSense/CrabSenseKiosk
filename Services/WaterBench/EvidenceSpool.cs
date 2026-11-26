@@ -3,12 +3,17 @@ using System.Text.Json;
 
 namespace CrabSenseKiosk.Services.WaterBench;
 
-// Single writer (WaterBenchSession lock). No deleting or uploading evidence in P2.1.
+// Immutable evidence with shared quota accounting for the serial writer and sync receipts.
 internal sealed class EvidenceSpool
 {
     private readonly string _root;
     private readonly long _maxBytes;
     private readonly int _maxFiles;
+    private readonly object _gate=new();
+    private readonly HashSet<Guid> _reservedReceipts=new();
+    internal const int ReceiptBudget=2048;
+    internal string Root=>_root;
+    internal int MaxFiles=>_maxFiles;
     private long _bytes;
     private int _files;
     internal EvidenceSpool(string root,long maxBytes,int maxFiles)
@@ -21,13 +26,39 @@ internal sealed class EvidenceSpool
         {
             _files++;
             _bytes += new FileInfo(path).Length;
+            var name=Path.GetFileName(path);
+            if((BenchSyncQueue.TryFileId(name,"batch-timeline-",out var id)||BenchSyncQueue.TryFileId(name,"media-manifest-",out id))&&
+                !File.Exists(Path.Combine(_root,BenchSyncQueue.ReceiptName(id))))_reservedReceipts.Add(id);
         }
     }
-    internal bool HasCapacity => _files + 3 <= _maxFiles && _bytes + 128*1024 <= _maxBytes;
+    private bool Fits(int files,long bytes)=>_files+(long)_reservedReceipts.Count+files<=_maxFiles&&
+        _bytes+(long)_reservedReceipts.Count*ReceiptBudget+bytes<=_maxBytes;
+    internal bool HasCapacity {get{lock(_gate)return Fits(4,128*1024+ReceiptBudget);}}
+    private void PutQueued(string filename,Guid id,byte[] bytes)
+    {
+        lock(_gate)
+        {
+            if(id==Guid.Empty||File.Exists(Path.Combine(_root,BenchSyncQueue.ReceiptName(id)))||!_reservedReceipts.Add(id))
+                throw new IOException("Duplicate queued event.");
+            try{Put(filename,bytes);}
+            catch{_reservedReceipts.Remove(id);throw;}
+        }
+    }
+    internal void PutReceipt(Guid id,byte[] bytes)
+    {
+        lock(_gate)
+        {
+            if(bytes.Length>ReceiptBudget||!_reservedReceipts.Remove(id))
+                throw new IOException("Receipt reservation unavailable.");
+            try{Put(BenchSyncQueue.ReceiptName(id),bytes);}
+            catch{_reservedReceipts.Add(id);throw;}
+        }
+    }
     private void Put(string filename,byte[] bytes)
     {
-        if (_files >= _maxFiles || bytes.LongLength > _maxBytes - _bytes)
-            throw new IOException("Water evidence spool full.");
+        lock(_gate)
+        {
+        if(!Fits(1,bytes.LongLength))throw new IOException("Water evidence spool full.");
         string target = Path.Combine(_root,filename);
         string temp = Path.Combine(_root,Guid.NewGuid().ToString("N")+".tmp");
         try
@@ -38,8 +69,9 @@ internal sealed class EvidenceSpool
             _bytes += bytes.Length; _files++;
         }
         finally { if (File.Exists(temp)) File.Delete(temp); }
+        }
     }
-    internal void BatchEvent(BenchBatchEvent value) => Put("batch-timeline-"+value.EventId.ToString("N")+".json",
+    internal void BatchEvent(BenchBatchEvent value) => PutQueued("batch-timeline-"+value.EventId.ToString("N")+".json",value.EventId,
         JsonSerializer.SerializeToUtf8Bytes(value,new JsonSerializerOptions(JsonSerializerDefaults.Web)));
     internal void Event(object value) => Put(Guid.NewGuid().ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal void Command(Guid id,object value) => Put("command-"+id.ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
@@ -60,6 +92,8 @@ internal sealed class EvidenceSpool
     }
     internal string Frame(ReceivedFrame frame,object link,BenchMediaIdentity? identity=null)
     {
+        lock(_gate)
+        {
         var eventId=Guid.NewGuid();
         var id=eventId.ToString("N");
         var manifest=identity is null?null:BenchMediaManifest.Create(eventId,frame,identity);
@@ -70,12 +104,13 @@ internal sealed class EvidenceSpool
             frame.CaptureId,frame.Sequence,frame.Width,frame.Height,frame.Crc,frame.ReceivedAt,link,
             uploadState="pending",actualExposureVerified=false,chemicalAccuracyValidated=false
         });
-        if(_files+(manifestBytes is null?2:3)>_maxFiles||
-            frame.Bytes.LongLength+rawBytes.LongLength+(manifestBytes?.LongLength??0)>_maxBytes-_bytes)
+        if(!Fits(manifestBytes is null?2:4,frame.Bytes.LongLength+rawBytes.LongLength+
+            (manifestBytes?.LongLength??0)+(manifestBytes is null?0:ReceiptBudget)))
             throw new IOException("Water evidence spool full.");
         Put(id+".jpg",frame.Bytes);
         Put(id+".json",rawBytes);
-        if(manifestBytes is not null)Put("media-manifest-"+id+".json",manifestBytes);
+        if(manifestBytes is not null)PutQueued("media-manifest-"+id+".json",eventId,manifestBytes);
         return id;
+        }
     }
 }
