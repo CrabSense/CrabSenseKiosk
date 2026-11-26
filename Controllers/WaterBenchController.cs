@@ -67,6 +67,13 @@ public sealed class WaterBenchController : ControllerBase
         if(!Allowed())return Unauthorized();
         return _schedule.Approve(approval.SlotId,DateTimeOffset.UtcNow,out var message)?Accepted(new{message}):Conflict(new{message});
     }
+    [HttpPost("recovery/confirm")]
+    [RequestSizeLimit(2048)]
+    public IActionResult ConfirmRecovery(BenchRecoveryRequest request)
+    {
+        if(!Allowed())return Unauthorized();
+        return _session.TryRecover(request,out var message)?Ok(new{message}):Conflict(new{message});
+    }
     [HttpGet("command/{requestId:guid}")]
     public IActionResult CommandStatus(Guid requestId)
     {

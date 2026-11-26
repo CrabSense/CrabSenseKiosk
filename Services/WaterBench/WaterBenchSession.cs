@@ -6,6 +6,7 @@ using System.Text.RegularExpressions;
 namespace CrabSenseKiosk.Services.WaterBench;
 
 public sealed record BenchCommand(Guid RequestId,string Action,int Id=0,int Mask=0,uint CaptureId=0,uint[]? Values=null);
+public sealed record BenchRecoveryRequest(Guid RequestId,bool InspectionConfirmed,string Reason);
 
 public sealed class WaterBenchSession
 {
@@ -45,6 +46,10 @@ public sealed class WaterBenchSession
     {
         (_options,_spool)=(options,spool);
         SyncQueue=new BenchSyncQueue(spool,options.BackendStationId);
+        // Fail closed on EVERY supervised process start, even when the last write
+        // was interrupted or the previous process could not persist a fault.
+        if(options.Enabled&&options.EnableSupervisedControl)
+        {_fault=true;_error="startup_inspection_required";}
     }
     public object SyncStatus()=>SyncQueue.Snapshot(_options.Enabled&&_options.EnableBatchSync,_options.EnableMediaSync,_options.EnableNh3EvidenceSync);
 
@@ -52,11 +57,15 @@ public sealed class WaterBenchSession
     {
         lock(_gate)
         {
+            InterruptTimeline("connection_replaced");EndUnknown("connection_replaced");
             _connection=Guid.NewGuid(); _write=write; _timeline=null;_nh3SampleEvent=_nh3ImageEvent=null;
             _master=_slave=_batch=_clean=_sample=null; _telemetry=null; _telemetryAt=null;
             _activeBatch=null; _startPending=false; _boot=null; _clock=null; _helloNonce=Guid.Empty; _pending=null; _lastSequence=0; _batchAtMs=_cleanAtMs=_telemetryAtMs=0; _sessions.Clear(); _links.Clear(); _frames.Clear(); _saved.Clear(); _camera.Reset();
             // Reconnect never silently releases prior uncertain state.
-            Store("connection_open",new { connection=_connection });
+            if(_options.Enabled&&_options.EnableSupervisedControl)
+            {_fault=true;_error="startup_or_reconnect_inspection_required";}
+            Store("connection_open",new { connection=_connection,recoveryRequired=_fault,
+                physicalCompletionConfirmed=false });
         }
     }
     internal void Disconnected()
@@ -66,13 +75,19 @@ public sealed class WaterBenchSession
             if (_activeBatch is not null || _write is not null) { _fault=true; _error="connection_lost_inspect_before_restart"; }
             InterruptTimeline("disconnect");
             EndUnknown("disconnect");
-            _write=null; _master=_slave=null; _boot=null; _clock=null; _camera.Reset(); _links.Clear(); _frames.Clear(); _saved.Clear();
-            try { Store("connection_closed",new { reason=_error }); } catch(IOException) { }
+            _write=null; _master=_slave=null; _boot=null; _clock=null;
+            _batchAtMs=_cleanAtMs=_telemetryAtMs=0;_helloNonce=Guid.Empty;_camera.Reset(); _links.Clear(); _frames.Clear(); _saved.Clear();
+            BestEffort("connection_closed",new { reason=_error,recoveryRequired=_fault,physicalCompletionConfirmed=false });
         }
     }
     private void Store(string kind,object value) => _spool.Event(new {
         kind,connection=_connection,receivedAt=DateTimeOffset.UtcNow,value,uploadState="pending"
     });
+    private void BestEffort(string kind,object value)
+    {
+        try{Store(kind,value);}
+        catch(Exception ex) when(ex is IOException or UnauthorizedAccessException){}
+    }
     private bool Identified => _master.HasValue && _slave.HasValue && _write is not null;
     private void EndUnknown(string reason)
     {
@@ -90,7 +105,10 @@ public sealed class WaterBenchSession
     {
         // Firmware fault line is followed by a structured terminal status.
         if(error!="firmware_reported_fault"&&error!="firmware_batch_fault")InterruptTimeline(error);
-        EndUnknown(error);_fault=true;_error=error;_camera.Reset();_frames.Clear();
+        EndUnknown(error);_fault=true;_error=error;
+        _batchAtMs=_cleanAtMs=_telemetryAtMs=0;_helloNonce=Guid.Empty;
+        _camera.Reset();_frames.Clear();
+        BestEffort("recovery_required",new{reason=error,bootId=_boot,activeBatch=_activeBatch,physicalCompletionConfirmed=false});
     }
     private void SendHelloLocked()
     {
@@ -113,6 +131,58 @@ public sealed class WaterBenchSession
         }
     }
     public object? CommandStatus(Guid id){lock(_gate)return _spool.CommandStatus(id);}
+    private string RecoveryReadinessLocked()
+    {
+        if(!_options.Enabled||!_options.EnableSupervisedControl)return "supervised_control_disabled";
+        if(!_fault)return "inspection_not_required";
+        if(!Identified||_pending!=null||_helloNonce!=Guid.Empty)return "identified_idle_connection_required";
+        if(_activeBatch!=null||_timeline?.Active==true)return "held_batch_requires_local_reset";
+        if(!_spool.HasCapacity)return "spool_full";
+        long now=NowMs;
+        if(_batch is null||_clean is null||_telemetry is null||_batchAtMs==0||_cleanAtMs==0||_telemetryAtMs==0||
+            now-_batchAtMs>15000||now-_cleanAtMs>15000||now-_telemetryAtMs>15000)return "fresh_status_required";
+        try
+        {
+            if(_batch.Value.GetProperty("state").GetInt32()!=0||
+                _batch.Value.GetProperty("owner").GetInt32()!=0||_batch.Value.GetProperty("work").GetInt32()!=0||
+                _clean.Value.GetProperty("step").GetString()!="idle"||_clean.Value.GetProperty("vial").GetInt32()!=0)
+                return "controller_not_idle";
+            var dirty=_clean.Value.GetProperty("dirty_mask").GetInt32();
+            if(dirty is <0 or >7||!_clean.Value.GetProperty("storage_ok").GetBoolean())return "clean_storage_not_ready";
+            foreach(var pair in new[]{("link","1"),("local","0"),("armed","0"),("slave_state","0"),("slave_ch","0"),
+                ("storage_ok","1"),("dirty_mask",dirty.ToString(CultureInfo.InvariantCulture))})
+                if(!_telemetry.TryGetValue(pair.Item1,out var value)||value!=pair.Item2)return "controller_not_idle";
+            return "operator_inspection_required";
+        }
+        catch(Exception ex) when(ex is InvalidOperationException or KeyNotFoundException or FormatException){return "invalid_recovery_status";}
+    }
+    public bool TryRecover(BenchRecoveryRequest request,out string message)
+    {
+        lock(_gate)
+        {
+            message=RecoveryReadinessLocked();
+            if(message!="operator_inspection_required")return false;
+            if(request.RequestId==Guid.Empty||!request.InspectionConfirmed||string.IsNullOrWhiteSpace(request.Reason)||
+                request.Reason.Length>200||request.Reason.Any(char.IsControl))
+            {message="Explicit local inspection confirmation and reason required.";return false;}
+            try
+            {
+                // Audit before releasing the software gate. No serial mutation here.
+                _spool.Recovery(request.RequestId,new{kind="operator_recovery",requestId=request.RequestId,
+                    connection=_connection,stationId=_options.BackendStationId,masterHardwareId=_options.MasterHardwareId,
+                    slaveHardwareId=_options.SlaveHardwareId,priorFault=_error,previousBootId=_boot,at=DateTimeOffset.UtcNow,
+                    reason=request.Reason.Trim(),operatorInspectionConfirmed=true,
+                    batch=_batch,clean=_clean,telemetry=_telemetry,physicalCompletionConfirmed=false,
+                    cleaningVerified=false,commandsReplayed=false});
+            }
+            catch(Exception ex) when(ex is IOException or UnauthorizedAccessException)
+            {message="Recovery audit could not be committed; gate remains locked.";return false;}
+            _fault=false;_error=null;_boot=null;_clock=null;_lastSequence=0;_helloNonce=Guid.Empty;
+            _startPending=false;_batchAtMs=_cleanAtMs=_telemetryAtMs=0;
+            message="Inspection recorded. Fresh gateway handshake and status required; no command replay.";
+            return true;
+        }
+    }
     private object? SampleClock(JsonElement e)
     {
         if(_clock is not { } c||_boot!=c.Boot)return null;
@@ -142,7 +212,7 @@ public sealed class WaterBenchSession
             if (master?_master.HasValue:_slave.HasValue)
             {
                 // A fresh boot/inventory while work is held is ambiguous.
-                if(_activeBatch is not null) Fault("inventory_during_batch");
+                if(_activeBatch is not null||_boot is not null) Fault("inventory_changed_inspection_required");
             }
             if(master)_master=e;else _slave=e;
             Store("inventory",e);return;
@@ -330,7 +400,8 @@ public sealed class WaterBenchSession
     {
         lock(_gate)return new {
             enabled=_options.Enabled,controlEnabled=_options.EnableSupervisedControl,connection=_connection,
-            identified=Identified,recoveryRequired=_fault,error=_error,spoolCapacity=_spool.HasCapacity,
+            identified=Identified,recoveryRequired=_fault,error=_error,recoveryReadiness=RecoveryReadinessLocked(),
+            startupInspectionRequired=true,spoolCapacity=_spool.HasCapacity,
             master=_master,slave=_slave,batch=_batch,clean=_clean,nh3Sample=_sample,
             telemetry=_telemetry is null?null:new Dictionary<string,string>(_telemetry),telemetryReceivedAt=_telemetryAt,
             activeBatch=_activeBatch,startPending=_startPending,gatewayBootId=_boot,gatewayReady=_boot is not null&&!_fault,pendingCommandId=_pending?.Id,clockObservation=_clock,scheduleReadiness=ReadinessLocked(),savedCaptureIds=_saved.Keys.ToArray(),clockBasis="kiosk_receipt_not_exposure",
@@ -345,7 +416,8 @@ public sealed class WaterBenchSession
         if(_startPending||_activeBatch is not null)return "batch_already_held_or_start_pending";
         if(!_spool.HasCapacity)return "spool_full";
         var now=NowMs;
-        if(_batch is null||_clean is null||_telemetry is null||now-_batchAtMs>15000||now-_cleanAtMs>15000||now-_telemetryAtMs>15000)
+        if(_batch is null||_clean is null||_telemetry is null||_batchAtMs==0||_cleanAtMs==0||_telemetryAtMs==0||
+            now-_batchAtMs>15000||now-_cleanAtMs>15000||now-_telemetryAtMs>15000)
             return "fresh_status_required";
         try
         {
@@ -377,13 +449,26 @@ public sealed class WaterBenchSession
         {
             message="Rejected";
             if(!_options.EnableSupervisedControl||request.RequestId==Guid.Empty||_write is null)return false;
-            // STOP can be sent even if the slave or evidence spool is unavailable.
+            // STOP is best-effort and must never wait for a successful disk write.
+            // Repeated STOP is allowed; each attempt gets separate audit evidence.
             if(request.Action=="stop")
             {
-                try{_write("stop");message="STOP sent; physical stop not confirmed";return true;}
-                catch(IOException){Fault("stop_transport_failed");return false;}
-                catch(InvalidOperationException){Fault("stop_transport_failed");return false;}
-                catch(TimeoutException){Fault("stop_transport_failed");return false;}
+                bool sent=false;
+                try{_write("stop");sent=true;}
+                catch(Exception ex) when(ex is IOException or InvalidOperationException or TimeoutException){}
+                Fault(sent?"operator_stop_inspection_required":"stop_transport_failed");
+                BestEffort("stop_attempt",new{requestId=request.RequestId,bootId=_boot,uartWriteReturned=sent,
+                    physicalStopConfirmed=false,recoveryRequired=true});
+                message=sent?"STOP sent; physical stop not confirmed":"STOP transport failed; use physical emergency stop";
+                return sent;
+            }
+            // Read-only probes are allowed during recovery, not mutations.
+            if(request.Action is "batchStatus" or "cleanStatus")
+            {
+                if(!Identified||BuildCommand(request) is not string probe)return false;
+                try{_write(probe);message="Status probe sent";return true;}
+                catch(Exception ex) when(ex is IOException or InvalidOperationException or TimeoutException)
+                {Fault("readiness_probe_failed");return false;}
             }
             if(!Identified||_fault||_boot is null||!_spool.HasCapacity)return false;
             if(_pending is not null||_helloNonce!=Guid.Empty){message="Gateway busy; no duplicate dispatch.";return false;}
@@ -391,17 +476,14 @@ public sealed class WaterBenchSession
             if(_startPending){message="Start pending; inspect firmware, no retry.";return false;}
             bool starting=request.Action is "manual" or "scheduled";
             if(starting&&_activeBatch is not null){message="Batch held.";return false;}
-            if(request.Action=="scheduled"&&ReadinessLocked()!="ready"){message=ReadinessLocked();return false;}
+            if(starting&&ReadinessLocked()!="ready"){message=ReadinessLocked();return false;}
             string? command=BuildCommand(request);
             if(command is null)return false;
             if(request.Action=="image" && (!_saved.TryGetValue(request.CaptureId,out var saved)||_activeBatch is null||saved.Analyte!=(request.Id==1?"NO2":request.Id==2?"NO3":"NH3")))return false;
             try
             {
                 // Journal before serial transmission; repeated request IDs never resend.
-                // Status probes do not mutate firmware and need no sequence.
-                if(request.Action is "batchStatus" or "cleanStatus")
-                {_write(command);message="Status probe sent";return true;}
-                if(_lastSequence==uint.MaxValue){Fault("sequence_exhausted");return false;}
+                 if(_lastSequence==uint.MaxValue){Fault("sequence_exhausted");return false;}
                 uint seq=_lastSequence+1;
                 string frame=GatewayWire.Command(_boot,seq,request.RequestId,command);
                 _spool.Command(request.RequestId,new {kind="command",request,command,connection=_connection,bootId=_boot,sequence=seq,at=DateTimeOffset.UtcNow,state="send_attempt"});

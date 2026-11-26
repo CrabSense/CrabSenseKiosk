@@ -83,6 +83,7 @@ internal sealed class EvidenceSpool
         JsonSerializer.SerializeToUtf8Bytes(value,BenchMediaManifest.Json));
     internal void Event(object value) => Put(Guid.NewGuid().ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal void Command(Guid id,object value) => Put("command-"+id.ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
+    internal void Recovery(Guid id,object value)=>Put("recovery-"+id.ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal bool HasCommand(Guid id)=>File.Exists(Path.Combine(_root,"command-"+id.ToString("N")+".json"));
     internal void Outcome(Guid id,object value)=>Put("outcome-"+id.ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal object? CommandStatus(Guid id)
@@ -95,7 +96,9 @@ internal sealed class EvidenceSpool
             if(new FileInfo(path).Length>16384)throw new IOException("Command journal size.");
             using var doc=JsonDocument.Parse(File.ReadAllBytes(path));return doc.RootElement.Clone();
         }
-        return new {requestId=id,attempt=Read(attempt),outcome=File.Exists(outcome)?Read(outcome):(JsonElement?)null,
+        var recorded=File.Exists(outcome)?Read(outcome):(JsonElement?)null;
+        return new {requestId=id,attempt=Read(attempt),outcome=recorded,
+            state=recorded.HasValue?"outcome_recorded":"outcome_missing_or_in_flight_no_replay",
             physicalCompletionConfirmed=false};
     }
     internal string Frame(ReceivedFrame frame,object link,BenchMediaIdentity? identity=null)
