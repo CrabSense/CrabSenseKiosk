@@ -102,6 +102,15 @@ try
     {
         builder.Services.AddHostedService<WaterBenchWorker>();
         builder.Services.AddHostedService<BenchScheduleWorker>();
+        if(builder.Configuration.GetValue<bool>("WaterBench:EnableBatchSync"))
+        {
+            builder.Services.AddHttpClient("water-bench-batch-sync",c=>
+            {
+                c.Timeout=TimeSpan.FromSeconds(8);
+                c.MaxResponseContentBufferSize=16384;
+            }).ConfigurePrimaryHttpMessageHandler(()=>new HttpClientHandler{AllowAutoRedirect=false,UseCookies=false});
+            builder.Services.AddHostedService<BackendBenchBatchSyncWorker>();
+        }
         if(builder.Configuration.GetValue<bool>("WaterBench:UseBackendSchedule"))
         {
             builder.Services.AddHttpClient("water-bench-config").ConfigurePrimaryHttpMessageHandler(()=>new HttpClientHandler{AllowAutoRedirect=false});
