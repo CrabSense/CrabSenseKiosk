@@ -18,6 +18,19 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
 {
     private const int MaxMetadata=16384;
     private readonly object _gate=new();
+    private string _transportState="disabled";
+    private DateTimeOffset? _lastAttemptAt,_lastReceiptAt;
+    private int? _lastHttpStatus;
+    internal void TransportStatus(string state,DateTimeOffset? attempt=null,DateTimeOffset? receipt=null,int? httpStatus=null)
+    {
+        lock(_gate)
+        {
+            _transportState=state;
+            if(attempt.HasValue)_lastAttemptAt=attempt;
+            if(receipt.HasValue)_lastReceiptAt=receipt;
+            _lastHttpStatus=httpStatus;
+        }
+    }
     private static JsonSerializerOptions Json=>BenchMediaManifest.Json;
     internal static string ReceiptName(Guid id)=>"sync-receipt-"+id.ToString("N")+".json";
     internal static bool TryFileId(string name,string prefix,out Guid id)
@@ -195,10 +208,15 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
             spool.PutReceipt(candidate.EventId,JsonSerializer.SerializeToUtf8Bytes(row,Json));
         }
     }
-    internal object Snapshot()
+    internal object Snapshot(bool batchSyncEnabled=false)
     {
-        var p=Scan();
-        return new{p.State,p.Pending,p.Acknowledged,p.Foreign,p.BlockedBatches,p.InvalidFiles,readyBatches=p.Ready.Count,
-            stationId=station,automaticUploadImplemented=false,rawEvidenceRetained=true,physicalCommandsReplayed=false};
+        lock(_gate)
+        {
+            var p=ScanLocked();
+            return new{p.State,p.Pending,p.Acknowledged,p.Foreign,p.BlockedBatches,p.InvalidFiles,readyBatches=p.Ready.Count,
+                stationId=station,automaticUploadImplemented=true,batchSyncEnabled,mediaSyncEnabled=false,
+                transportState=batchSyncEnabled?_transportState:"disabled",lastAttemptAt=_lastAttemptAt,lastReceiptAt=_lastReceiptAt,
+                lastHttpStatus=_lastHttpStatus,rawEvidenceRetained=true,physicalCommandsReplayed=false};
+        }
     }
 }

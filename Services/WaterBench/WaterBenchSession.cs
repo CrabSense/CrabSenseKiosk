@@ -45,7 +45,7 @@ public sealed class WaterBenchSession
         (_options,_spool)=(options,spool);
         SyncQueue=new BenchSyncQueue(spool,options.BackendStationId);
     }
-    public object SyncStatus()=>SyncQueue.Snapshot();
+    public object SyncStatus()=>SyncQueue.Snapshot(_options.Enabled&&_options.EnableBatchSync);
 
     internal void Connected(Action<string> write)
     {
