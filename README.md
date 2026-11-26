@@ -142,3 +142,5 @@ CrabSenseIot (ESP32/sensors)
 Opt-in separate WaterBench worker and local supervised API, bounded evidence spool and JPEG verification. See [P2.1 water bench](docs/water-bench-p2.1.md). No cloud upload or unattended operation.
 
 P2.1.1: [Supervised daily water analysis schedule](docs/water-bench-schedule.md), Vietnam UTC+7, persistent due slots and no automatic replay. Operator approval required before UART dispatch.
+
+P2.1.2: [Boot-scoped UART ACK and clock observations](docs/water-bench-gateway.md). Pair with hardware gateway firmware.
