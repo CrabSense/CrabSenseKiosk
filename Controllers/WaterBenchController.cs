@@ -28,7 +28,29 @@ public sealed class WaterBenchController : ControllerBase
     [HttpGet("status")]
     public IActionResult Status()=>Allowed()?Ok(_session.Snapshot()):Unauthorized();
     [HttpGet("sync/status")]
-    public IActionResult SyncStatus()=>Allowed()?Ok(_session.SyncStatus()):Unauthorized();
+    public IActionResult SyncStatus()
+    {
+        if(!Allowed())return Unauthorized();
+        Response.Headers.CacheControl="no-store";
+        return Ok(_session.SyncStatus());
+    }
+    [HttpGet("sync/batches")]
+    public IActionResult SyncBatches([FromQuery]int skip=0,[FromQuery]int take=25)
+    {
+        if(!Allowed())return Unauthorized();
+        if(skip<0||skip>100000||take is <1 or >50)return BadRequest(new{message="Invalid page."});
+        Response.Headers.CacheControl="no-store";
+        return Ok(_session.SyncQueue.Batches(skip,take));
+    }
+    [HttpGet("sync/batches/{bootId}/{batchId}/receipts")]
+    public IActionResult SyncReceipts(string bootId,string batchId)
+    {
+        if(!Allowed())return Unauthorized();
+        if(!WireProtocol.BatchId(bootId)||!WireProtocol.BatchId(batchId))return BadRequest(new{message="Invalid batch identity."});
+        Response.Headers.CacheControl="no-store";
+        var data=_session.SyncQueue.BatchReceipts(bootId,batchId);
+        return data is null?NotFound():Ok(data);
+    }
     [HttpGet("schedule")]
     public IActionResult Schedule()=>Allowed()?Ok(_schedule.Snapshot(DateTimeOffset.UtcNow)):Unauthorized();
     [HttpPut("schedule")]

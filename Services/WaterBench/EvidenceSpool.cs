@@ -34,6 +34,12 @@ internal sealed class EvidenceSpool
     private bool Fits(int files,long bytes)=>_files+(long)_reservedReceipts.Count+files<=_maxFiles&&
         _bytes+(long)_reservedReceipts.Count*ReceiptBudget+bytes<=_maxBytes;
     internal bool HasCapacity {get{lock(_gate)return Fits(4,128*1024+ReceiptBudget);}}
+    internal object CapacitySnapshot()
+    {
+        lock(_gate)return new{usedBytes=_bytes,usedFiles=_files,maxBytes=_maxBytes,maxFiles=_maxFiles,
+            reservedReceiptFiles=_reservedReceipts.Count,reservedReceiptBytes=(long)_reservedReceipts.Count*ReceiptBudget,
+            hasCapacity=Fits(4,128*1024+ReceiptBudget),basis="tracked_spool_files_excludes_subdirectories"};
+    }
     private void PutQueued(string filename,Guid id,byte[] bytes)
     {
         lock(_gate)
