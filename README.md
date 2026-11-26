@@ -137,3 +137,6 @@ CrabSenseIot (ESP32/sensors)
 | [CrabSenseBE](https://github.com/CrabSense/CrabSenseBE) | Nhận HDF5 + API nghiệp vụ (gồm payment/invoice) |
 | [CrabSenseFE](https://github.com/CrabSense/CrabSenseFE) | UI bán hàng / hóa đơn / giám sát |
 | [CrabSenseApp](https://github.com/CrabSense/CrabSenseApp) | Mobile hiện trường |
+
+## Water quality V2 UART integration
+Opt-in separate WaterBench worker and local supervised API, bounded evidence spool and JPEG verification. See [P2.1 water bench](docs/water-bench-p2.1.md). No cloud upload or unattended operation.

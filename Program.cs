@@ -1,6 +1,7 @@
 using CrabSenseKiosk.Data;
 using CrabSenseKiosk.Middleware;
 using CrabSenseKiosk.Services;
+using CrabSenseKiosk.Services.WaterBench;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
 using Serilog;
@@ -83,6 +84,16 @@ try
     builder.Services.AddHostedService<KioskHeartbeatWorker>();
     builder.Services.AddHttpClient("camera-recording").ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
     builder.Services.AddHostedService<CameraRecordingWorker>();
+
+    builder.Services.Configure<WaterBenchOptions>(builder.Configuration.GetSection(WaterBenchOptions.SectionName));
+    builder.Services.AddSingleton<WaterBenchSession>(sp =>
+    {
+        var options = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<WaterBenchOptions>>().Value;
+        return new WaterBenchSession(options,new EvidenceSpool(
+            Path.Combine(builder.Environment.ContentRootPath,options.EvidenceDirectory),options.MaxSpoolBytes,options.MaxSpoolFiles));
+    });
+    if (builder.Configuration.GetValue<bool>("WaterBench:Enabled"))
+        builder.Services.AddHostedService<WaterBenchWorker>();
 
     var app = builder.Build();
 

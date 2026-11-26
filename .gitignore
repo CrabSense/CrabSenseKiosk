@@ -76,3 +76,6 @@ appsettings.Production.json
 be-url.txt
 kiosk-secret.txt
 kiosk-identity.txt
+
+# Local water bench evidence and operator configuration
+water-bench-spool/
