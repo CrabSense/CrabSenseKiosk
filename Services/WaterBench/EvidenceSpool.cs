@@ -39,6 +39,8 @@ internal sealed class EvidenceSpool
         }
         finally { if (File.Exists(temp)) File.Delete(temp); }
     }
+    internal void BatchEvent(BenchBatchEvent value) => Put("batch-timeline-"+value.EventId.ToString("N")+".json",
+        JsonSerializer.SerializeToUtf8Bytes(value,new JsonSerializerOptions(JsonSerializerDefaults.Web)));
     internal void Event(object value) => Put(Guid.NewGuid().ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal void Command(Guid id,object value) => Put("command-"+id.ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal bool HasCommand(Guid id)=>File.Exists(Path.Combine(_root,"command-"+id.ToString("N")+".json"));
