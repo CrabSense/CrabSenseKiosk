@@ -37,7 +37,7 @@ public sealed class WaterBenchSession
     private uint _lastSequence;
     private ClockObservation? _clock;
     private PendingCommand? _pending;
-    private sealed record PendingCommand(Guid Id,uint Seq,string Action,long SentMs);
+    private sealed record PendingCommand(Guid Id,uint Seq,string Action,long SentMs,string Boot,string AttemptSha256);
     private sealed record ImageLink(string Batch,string Analyte,string Session,uint CaptureId,DateTimeOffset At,long MonotonicMs);
     private static long NowMs => (long)(Stopwatch.GetTimestamp() * (1000.0 / Stopwatch.Frequency));
 
@@ -93,8 +93,8 @@ public sealed class WaterBenchSession
     {
         if(_pending is not { } p)return;
         _pending=null;
-        try{_spool.Outcome(p.Id,new {state="unknown",reason,connection=_connection,bootId=_boot,sequence=p.Seq,at=DateTimeOffset.UtcNow});}
-        catch(Exception ex) when(ex is IOException or UnauthorizedAccessException){}
+        try{_spool.FinishCommand(new(1,p.Id,_connection,p.Boot,p.Seq,p.AttemptSha256,"unknown",reason,DateTimeOffset.UtcNow));}
+        catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or FormatException or JsonException or InvalidOperationException){}
     }
     private void InterruptTimeline(string reason)
     {
@@ -130,7 +130,8 @@ public sealed class WaterBenchSession
             catch(Exception ex) when(ex is IOException or InvalidOperationException or TimeoutException){Fault("gateway_handshake_transport");}
         }
     }
-    public object? CommandStatus(Guid id){lock(_gate)return _spool.CommandStatus(id);}
+    public object? CommandStatus(Guid id){lock(_gate)return _spool.CommandStatus(id,_pending?.Id);}
+    public object Commands(int skip,int take){lock(_gate)return _spool.Commands(skip,take,_pending?.Id);}
     private string RecoveryReadinessLocked()
     {
         if(!_options.Enabled||!_options.EnableSupervisedControl)return "supervised_control_disabled";
@@ -241,8 +242,8 @@ public sealed class WaterBenchSession
             bool start=p.Action is "manual" or "scheduled";
             if(start&&ack.Accepted&&(_activeBatch is null||ack.BatchId!=_activeBatch))
             {Fault("batch_start_ack_mismatch");return;}
-            _spool.Outcome(p.Id,new {state=ack.Accepted?"accepted":"rejected",ack,connection=_connection,receivedAt=utc,
-                estimatedControllerUtc=_clock?.Estimate(ack.UptimeMs,now),physicalCompletionConfirmed=false});
+            _spool.FinishCommand(new(1,p.Id,_connection,p.Boot,p.Seq,p.AttemptSha256,
+                ack.Accepted?"accepted":"rejected",ack.Reason,utc,ack,_clock?.Estimate(ack.UptimeMs,now)));
             _pending=null;_lastSequence=ack.Sequence;
             if(start){_startPending=false;_batchAtMs=_cleanAtMs=0;}
             return;
@@ -448,7 +449,7 @@ public sealed class WaterBenchSession
         lock(_gate)
         {
             message="Rejected";
-            if(!_options.EnableSupervisedControl||request.RequestId==Guid.Empty||_write is null)return false;
+            if(!_options.Enabled||!_options.EnableSupervisedControl||request.RequestId==Guid.Empty||_write is null)return false;
             // STOP is best-effort and must never wait for a successful disk write.
             // Repeated STOP is allowed; each attempt gets separate audit evidence.
             if(request.Action=="stop")
@@ -486,8 +487,10 @@ public sealed class WaterBenchSession
                  if(_lastSequence==uint.MaxValue){Fault("sequence_exhausted");return false;}
                 uint seq=_lastSequence+1;
                 string frame=GatewayWire.Command(_boot,seq,request.RequestId,command);
-                _spool.Command(request.RequestId,new {kind="command",request,command,connection=_connection,bootId=_boot,sequence=seq,at=DateTimeOffset.UtcNow,state="send_attempt"});
-                _pending=new(request.RequestId,seq,request.Action,NowMs);
+                var attempt=new BenchCommandAttempt(1,request.RequestId,_options.BackendStationId,_connection,_boot,seq,
+                    request,command,DateTimeOffset.UtcNow);
+                string digest=_spool.BeginCommand(attempt);
+                _pending=new(request.RequestId,seq,request.Action,NowMs,_boot,digest);
                 if(starting){_startPending=true;_batchAtMs=_cleanAtMs=0;}
                 _write(frame);message="Sent to UART; query command status for ACK";return true;
             }
@@ -495,6 +498,7 @@ public sealed class WaterBenchSession
             catch(UnauthorizedAccessException){Fault("command_journal_access_failed");return false;}
             catch(InvalidOperationException){Fault("command_transport_failed");return false;}
             catch(TimeoutException){Fault("command_transport_failed");return false;}
+            catch(FormatException){Fault("command_journal_invalid");return false;}
         }
     }
     internal static string? BuildCommand(BenchCommand r)

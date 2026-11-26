@@ -74,10 +74,19 @@ public sealed class WaterBenchController : ControllerBase
         if(!Allowed())return Unauthorized();
         return _session.TryRecover(request,out var message)?Ok(new{message}):Conflict(new{message});
     }
+    [HttpGet("commands")]
+    public IActionResult Commands([FromQuery]int skip=0,[FromQuery]int take=25)
+    {
+        if(!Allowed())return Unauthorized();
+        if(skip<0||skip>100000||take is <1 or >50)return BadRequest(new{message="Invalid page."});
+        Response.Headers.CacheControl="no-store";
+        return Ok(_session.Commands(skip,take));
+    }
     [HttpGet("command/{requestId:guid}")]
     public IActionResult CommandStatus(Guid requestId)
     {
         if(!Allowed())return Unauthorized();
+        Response.Headers.CacheControl="no-store";
         var status=_session.CommandStatus(requestId);
         return status is null?NotFound():Ok(status);
     }
