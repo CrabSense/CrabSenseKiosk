@@ -39,8 +39,13 @@ public sealed class WaterBenchSession
     private sealed record ImageLink(string Batch,string Analyte,string Session,uint CaptureId,DateTimeOffset At,long MonotonicMs);
     private static long NowMs => (long)(Stopwatch.GetTimestamp() * (1000.0 / Stopwatch.Frequency));
 
+    internal BenchSyncQueue SyncQueue {get;}
     internal WaterBenchSession(WaterBenchOptions options,EvidenceSpool spool)
-        => (_options,_spool)=(options,spool);
+    {
+        (_options,_spool)=(options,spool);
+        SyncQueue=new BenchSyncQueue(spool,options.BackendStationId);
+    }
+    public object SyncStatus()=>SyncQueue.Snapshot();
 
     internal void Connected(Action<string> write)
     {
