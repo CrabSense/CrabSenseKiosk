@@ -74,3 +74,78 @@ jobs:
           dotnet-version: "8.0.x"
       - name: WaterBench protocol and JPEG decode tests
         run: dotnet test tests/CrabSenseKiosk.Tests/CrabSenseKiosk.Tests.csproj -c Release --filter "FullyQualifiedName~WaterBenchTests|FullyQualifiedName~BenchScheduleTests|FullyQualifiedName~GatewayAckTests|FullyQualifiedName~BackendBenchConfigurationTests|FullyQualifiedName~BatchObservationJournalTests|FullyQualifiedName~BenchMediaManifestTests|FullyQualifiedName~BenchSyncQueueTests|FullyQualifiedName~BackendBenchBatchSyncTests|FullyQualifiedName~BackendBenchMediaSyncTests|FullyQualifiedName~Nh3EvidenceSyncTests|FullyQualifiedName~BenchSyncRetryJournalTests|FullyQualifiedName~BenchSyncMonitoringTests"
+
+  water-bench-cross-integration:
+    name: WaterBench Kiosk + pinned BE + PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: water_bench_ci
+          POSTGRES_USER: water_bench_ci
+          POSTGRES_PASSWORD: water-bench-ci-only
+        ports:
+          - 55439:5432
+        options: >-
+          --health-cmd "pg_isready -U water_bench_ci -d water_bench_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout reviewed public Backend commit
+        uses: actions/checkout@v4
+        with:
+          repository: CrabSense/CrabSenseBE
+          ref: 147ee9434ee9c0e05440ce8ab1ed9efab73f6943
+          path: tests/_backend
+          persist-credentials: false
+      - name: Verify Backend pin
+        run: test "$(git -C tests/_backend rev-parse HEAD)" = 147ee9434ee9c0e05440ce8ab1ed9efab73f6943
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Run real HTTP/controller/DB integration with private storage double
+        env:
+          WATER_BENCH_CI_DB: Host=127.0.0.1;Port=55439;Database=water_bench_ci;Username=water_bench_ci;Password=water-bench-ci-only
+        run: |
+          dotnet test tests/WaterBench.CrossIntegration/WaterBench.CrossIntegration.csproj -c Release --logger "trx;LogFileName=water-bench-cross.trx" --results-directory TestResults/WaterBench
+          python3 - <<'PY'
+          import xml.etree.ElementTree as E
+          from pathlib import Path
+          p = Path('TestResults/WaterBench/water-bench-cross.trx')
+          c = E.parse(p).find('.//{*}Counters').attrib
+          assert int(c['total']) >= 1 and int(c['passed']) == int(c['total']) and int(c['failed']) == 0, c
+          print('WaterBench cross-integration counters:', c)
+          PY
+      # Keep the test and TRX assertions mandatory above. Artifact quota is not a test result.
+      - name: Summarize cross-integration results
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as E
+          p = Path('TestResults/WaterBench/water-bench-cross.trx')
+          if p.exists():
+              c = E.parse(p).find('.//{*}Counters').attrib
+              summary = 'WaterBench integration: ' + ', '.join(f'{k}={v}' for k,v in c.items() if k in ('total','passed','failed','notExecuted'))
+          else:
+              summary = 'WaterBench integration: TRX missing; inspect the mandatory test step.'
+          print(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write(summary + '\n')
+          PY
+      - name: Upload optional cross-integration artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: water-bench-cross-integration-${{ github.sha }}
+          path: TestResults/WaterBench/
+          if-no-files-found: warn
+          retention-days: 3
