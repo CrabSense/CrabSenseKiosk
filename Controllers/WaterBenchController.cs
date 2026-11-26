@@ -13,8 +13,9 @@ public sealed class WaterBenchController : ControllerBase
 {
     private readonly WaterBenchOptions _options;
     private readonly WaterBenchSession _session;
-    public WaterBenchController(IOptions<WaterBenchOptions> options,WaterBenchSession session)
-        =>(_options,_session)=(options.Value,session);
+    private readonly BenchSchedule _schedule;
+    public WaterBenchController(IOptions<WaterBenchOptions> options,WaterBenchSession session,BenchSchedule schedule)
+        =>(_options,_session,_schedule)=(options.Value,session,schedule);
     private bool Allowed()
     {
         var ip=HttpContext.Connection.RemoteIpAddress;
@@ -26,6 +27,22 @@ public sealed class WaterBenchController : ControllerBase
     }
     [HttpGet("status")]
     public IActionResult Status()=>Allowed()?Ok(_session.Snapshot()):Unauthorized();
+    [HttpGet("schedule")]
+    public IActionResult Schedule()=>Allowed()?Ok(_schedule.Snapshot(DateTimeOffset.UtcNow)):Unauthorized();
+    [HttpPut("schedule")]
+    [RequestSizeLimit(4096)]
+    public IActionResult ConfigureSchedule(BenchScheduleSettings settings)
+    {
+        if(!Allowed())return Unauthorized();
+        return _schedule.Configure(settings,DateTimeOffset.UtcNow,out var message)?Ok(new{message}):BadRequest(new{message});
+    }
+    [HttpPost("schedule/approve")]
+    [RequestSizeLimit(1024)]
+    public IActionResult ApproveSchedule(BenchScheduleApproval approval)
+    {
+        if(!Allowed())return Unauthorized();
+        return _schedule.Approve(approval.SlotId,DateTimeOffset.UtcNow,out var message)?Accepted(new{message}):Conflict(new{message});
+    }
     [HttpPost("command")]
     [RequestSizeLimit(4096)]
     public IActionResult Command(BenchCommand request)

@@ -25,7 +25,8 @@ public sealed class WaterBenchSession
     private bool _fault;
     private Guid _connection;
     private string? _error;
-    private long _lastTelemetryStored;
+    private long _lastTelemetryStored,_batchAtMs,_cleanAtMs,_telemetryAtMs;
+    private bool _startPending;
     private sealed record ImageLink(string Batch,string Analyte,string Session,uint CaptureId,DateTimeOffset At,long MonotonicMs);
     private static long NowMs => (long)(Stopwatch.GetTimestamp() * (1000.0 / Stopwatch.Frequency));
 
@@ -38,7 +39,7 @@ public sealed class WaterBenchSession
         {
             _connection=Guid.NewGuid(); _write=write;
             _master=_slave=_batch=_clean=_sample=null; _telemetry=null; _telemetryAt=null;
-            _activeBatch=null; _sessions.Clear(); _links.Clear(); _frames.Clear(); _saved.Clear(); _camera.Reset();
+            _activeBatch=null; _startPending=false; _batchAtMs=_cleanAtMs=_telemetryAtMs=0; _sessions.Clear(); _links.Clear(); _frames.Clear(); _saved.Clear(); _camera.Reset();
             // Reconnect never silently releases prior uncertain state.
             Store("connection_open",new { connection=_connection });
         }
@@ -106,7 +107,7 @@ public sealed class WaterBenchSession
         {
             var p=line.Split(' ',StringSplitOptions.RemoveEmptyEntries);
             if(p.Length!=5||!WireProtocol.BatchId(p[2])||_activeBatch is not null)throw new FormatException("Unexpected batch start.");
-            _activeBatch=p[2];_sessions.Clear();_saved.Clear();_links.Clear();_frames.Clear();_camera.Reset();
+            _activeBatch=p[2];_startPending=false;_sessions.Clear();_saved.Clear();_links.Clear();_frames.Clear();_camera.Reset();
             Store("batch_start",line);return;
         }
         if(line.StartsWith("BATCH SESSION ",StringComparison.Ordinal))
@@ -133,13 +134,13 @@ public sealed class WaterBenchSession
             var e=WireProtocol.Json(line[13..]);int state=e.GetProperty("state").GetInt32();
             if(state<0||state>3)throw new FormatException("Batch state.");
             if(state==1&&e.GetProperty("batch_id").GetString()!=_activeBatch)Fault("unknown_running_batch");
-            _batch=e;Store("batch_status",e);
+            _batch=e;_batchAtMs=now;Store("batch_status",e);
             if(state==3)Fault("firmware_batch_fault");
             return;
         }
         if(line.StartsWith("CLEAN STATUS ",StringComparison.Ordinal))
         {
-            _clean=WireProtocol.Json(line[13..]);Store("clean_status",_clean.Value);return;
+            _clean=WireProtocol.Json(line[13..]);_cleanAtMs=now;Store("clean_status",_clean.Value);return;
         }
         if(line.StartsWith("NH3 SAMPLE ",StringComparison.Ordinal))
         {
@@ -155,7 +156,7 @@ public sealed class WaterBenchSession
         {
             _telemetry=line.Split(' ',StringSplitOptions.RemoveEmptyEntries).Select(p=>p.Split('=',2))
                 .Where(p=>p.Length==2).ToDictionary(p=>p[0],p=>p[1],StringComparer.Ordinal);
-            _telemetryAt=utc;
+            _telemetryAt=utc;_telemetryAtMs=now;
             if(now-_lastTelemetryStored>=10000){Store("telemetry_observation",_telemetry);_lastTelemetryStored=now;}
             return;
         }
@@ -163,6 +164,7 @@ public sealed class WaterBenchSession
         {
             _activeBatch=null;_sessions.Clear();_links.Clear();_frames.Clear();_saved.Clear();_camera.Reset();Store("operator_event",line);return;
         }
+        if(line=="REJECT batch preflight"&&_startPending){_startPending=false;_batchAtMs=_cleanAtMs=0;}
         if(line.StartsWith("BATCH FAULT",StringComparison.Ordinal)||line.StartsWith("CLEAN FAULT",StringComparison.Ordinal))
             Fault("firmware_reported_fault");
         if(line.StartsWith("BATCH ",StringComparison.Ordinal)||line.StartsWith("CLEAN ",StringComparison.Ordinal)||line.StartsWith("REJECT",StringComparison.Ordinal))
@@ -182,9 +184,42 @@ public sealed class WaterBenchSession
             identified=Identified,recoveryRequired=_fault,error=_error,spoolCapacity=_spool.HasCapacity,
             master=_master,slave=_slave,batch=_batch,clean=_clean,nh3Sample=_sample,
             telemetry=_telemetry is null?null:new Dictionary<string,string>(_telemetry),telemetryReceivedAt=_telemetryAt,
-            activeBatch=_activeBatch,savedCaptureIds=_saved.Keys.ToArray(),clockBasis="kiosk_receipt_not_exposure",
+            activeBatch=_activeBatch,startPending=_startPending,scheduleReadiness=ReadinessLocked(),savedCaptureIds=_saved.Keys.ToArray(),clockBasis="kiosk_receipt_not_exposure",
             physicalAlignmentVerified=false,backendUploadImplemented=false
         };
+    }
+    private string ReadinessLocked()
+    {
+        if(!_options.Enabled||!_options.EnableSupervisedControl)return "supervised_control_disabled";
+        if(!Identified||_fault)return "connection_or_recovery_required";
+        if(_startPending||_activeBatch is not null)return "batch_already_held_or_start_pending";
+        if(!_spool.HasCapacity)return "spool_full";
+        var now=NowMs;
+        if(_batch is null||_clean is null||_telemetry is null||now-_batchAtMs>15000||now-_cleanAtMs>15000||now-_telemetryAtMs>15000)
+            return "fresh_status_required";
+        try
+        {
+            if(!_master!.Value.GetProperty("outputsEnabled").GetBoolean()||!_slave!.Value.GetProperty("outputsEnabled").GetBoolean()||
+                !_master.Value.GetProperty("rs485Enabled").GetBoolean()||!_slave.Value.GetProperty("rs485Enabled").GetBoolean()||
+                !_slave.Value.GetProperty("cameraSupported").GetBoolean())return "firmware_capability_disabled";
+            if(_batch.Value.GetProperty("state").GetInt32()!=0)return "batch_not_idle";
+            if(!_clean.Value.GetProperty("ready_for_assay").GetBoolean()||_clean.Value.GetProperty("dirty_mask").GetInt32()!=0||
+                !_clean.Value.GetProperty("storage_ok").GetBoolean())return "cleaning_required";
+            foreach(var pair in new[]{("link","1"),("local","0"),("armed","0"),("slave_state","0"),("slave_ch","0"),("cal_mask","0x7f"),("storage_ok","1"),("dirty_mask","0")})
+                if(!_telemetry.TryGetValue(pair.Item1,out var value)||value!=pair.Item2)return "controller_not_ready";
+            return "ready";
+        }
+        catch(Exception ex) when(ex is InvalidOperationException or KeyNotFoundException or FormatException){return "invalid_readiness_status";}
+    }
+    internal string ScheduleReadiness(){lock(_gate)return ReadinessLocked();}
+    internal void ProbeScheduleReadiness()
+    {
+        lock(_gate)
+        {
+            if(!Identified||_fault||_startPending||_activeBatch is not null||!_spool.HasCapacity)return;
+            try{_write!("batch status");_write("clean status");}
+            catch(Exception ex) when(ex is IOException or InvalidOperationException or TimeoutException){Fault("readiness_probe_failed");}
+        }
     }
     public bool TryCommand(BenchCommand request,out string message)
     {
@@ -198,8 +233,13 @@ public sealed class WaterBenchSession
                 try{_write("stop");message="STOP sent; physical stop not confirmed";return true;}
                 catch(IOException){Fault("stop_transport_failed");return false;}
                 catch(InvalidOperationException){Fault("stop_transport_failed");return false;}
+                catch(TimeoutException){Fault("stop_transport_failed");return false;}
             }
             if(!Identified||_fault||!_spool.HasCapacity)return false;
+            if(_startPending){message="Start pending; inspect firmware, no retry.";return false;}
+            bool starting=request.Action is "manual" or "scheduled";
+            if(starting&&_activeBatch is not null){message="Batch held.";return false;}
+            if(request.Action=="scheduled"&&ReadinessLocked()!="ready"){message=ReadinessLocked();return false;}
             string? command=BuildCommand(request);
             if(command is null)return false;
             if(request.Action=="image" && (!_saved.TryGetValue(request.CaptureId,out var saved)||_activeBatch is null||saved.Analyte!=(request.Id==1?"NO2":request.Id==2?"NO3":"NH3")))return false;
@@ -207,10 +247,12 @@ public sealed class WaterBenchSession
             {
                 // Journal before serial transmission; repeated request IDs never resend.
                 _spool.Command(request.RequestId,new { kind="command",request,command,connection=_connection,at=DateTimeOffset.UtcNow,state="send_attempt" });
+                if(starting){_startPending=true;_batchAtMs=_cleanAtMs=0;}
                 _write(command);message="Sent to UART; firmware acceptance not confirmed";return true;
             }
             catch(IOException){Fault("command_journal_or_transport_failed");return false;}
             catch(InvalidOperationException){Fault("command_transport_failed");return false;}
+            catch(TimeoutException){Fault("command_transport_failed");return false;}
         }
     }
     internal static string? BuildCommand(BenchCommand r)

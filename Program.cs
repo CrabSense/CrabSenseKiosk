@@ -92,8 +92,17 @@ try
         return new WaterBenchSession(options,new EvidenceSpool(
             Path.Combine(builder.Environment.ContentRootPath,options.EvidenceDirectory),options.MaxSpoolBytes,options.MaxSpoolFiles));
     });
+    builder.Services.AddSingleton<BenchSchedule>(sp =>
+    {
+        var options=sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<WaterBenchOptions>>().Value;
+        return new BenchSchedule(options,sp.GetRequiredService<WaterBenchSession>(),
+            Path.Combine(builder.Environment.ContentRootPath,options.EvidenceDirectory,"schedule"),DateTimeOffset.UtcNow);
+    });
     if (builder.Configuration.GetValue<bool>("WaterBench:Enabled"))
+    {
         builder.Services.AddHostedService<WaterBenchWorker>();
+        builder.Services.AddHostedService<BenchScheduleWorker>();
+    }
 
     var app = builder.Build();
 
