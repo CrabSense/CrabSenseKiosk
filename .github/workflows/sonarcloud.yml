@@ -63,3 +63,14 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+
+  water-bench-windows:
+    name: WaterBench Windows runtime tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: WaterBench protocol and JPEG decode tests
+        run: dotnet test tests/CrabSenseKiosk.Tests/CrabSenseKiosk.Tests.csproj -c Release --filter FullyQualifiedName~WaterBenchTests

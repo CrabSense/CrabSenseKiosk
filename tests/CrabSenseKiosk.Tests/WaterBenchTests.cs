@@ -1,8 +1,6 @@
 using System.Text.Json;
 using CrabSenseKiosk.Services.WaterBench;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Formats.Jpeg;
+using SkiaSharp;
 using Xunit;
 
 namespace CrabSenseKiosk.Tests;
@@ -25,9 +23,11 @@ public sealed class WaterBenchTests
     [Fact]
     public void CameraChecksCrcOffsetsAndDecode()
     {
-        using var image=new Image<Rgb24>(16,16);
-        using var stream=new MemoryStream();image.Save(stream,new JpegEncoder());
-        var bytes=stream.ToArray();var crc=WireProtocol.Crc32(bytes);var receiver=new CameraReceiver();var now=DateTimeOffset.UtcNow;
+        using var image=new SKBitmap(16,16);
+        image.Erase(SKColors.Yellow);
+        using var encoded=image.Encode(SKEncodedImageFormat.Jpeg,90);
+        Assert.NotNull(encoded);
+        var bytes=encoded!.ToArray();var crc=WireProtocol.Crc32(bytes);var receiver=new CameraReceiver();var now=DateTimeOffset.UtcNow;
         Assert.Equal(0xcbf43926u,WireProtocol.Crc32("123456789"u8));
         string header=$"CAM BEGIN 5 1 16 16 {bytes.Length} {crc:x8}";
         receiver.Feed(header,now,0);
@@ -38,6 +38,34 @@ public sealed class WaterBenchTests
         Assert.NotNull(result);Assert.Equal(bytes,result!.Bytes);
         receiver.Feed(header,now,5);
         Assert.Throws<FormatException>(()=>receiver.Feed("CAM END 5",now,6));
+    }
+    [Fact]
+    public void RejectsInvalidJpegEvenWithValidEnvelopeAndCrc()
+    {
+        byte[] invalid={0xff,0xd8,0xff,0xd9};
+        var receiver=new CameraReceiver();
+        var now=DateTimeOffset.UtcNow;
+        receiver.Feed($"CAM BEGIN 5 1 16 16 4 {WireProtocol.Crc32(invalid):x8}",now,0);
+        receiver.Feed("CAM DATA 5 0 FFD8FFD9",now,1);
+        Assert.Throws<FormatException>(()=>receiver.Feed("CAM END 5",now,2));
+        Assert.Throws<FormatException>(()=>WireProtocol.ValidateJpeg(invalid,16,16));
+        Assert.Throws<FormatException>(()=>WireProtocol.ValidateJpeg(invalid,0,16));
+        Assert.Throws<FormatException>(()=>WireProtocol.ValidateJpeg(invalid,2000,2000));
+    }
+    [Fact]
+    public void RejectsWrongDimensionsAndCrc()
+    {
+        using var image=new SKBitmap(16,16);
+        image.Erase(SKColors.Yellow);
+        using var encoded=image.Encode(SKEncodedImageFormat.Jpeg,90);
+        Assert.NotNull(encoded);
+        var bytes=encoded!.ToArray();
+        WireProtocol.ValidateJpeg(bytes,16,16);
+        Assert.Throws<FormatException>(()=>WireProtocol.ValidateJpeg(bytes,15,16));
+        var receiver=new CameraReceiver();var now=DateTimeOffset.UtcNow;
+        receiver.Feed($"CAM BEGIN 5 1 16 16 {bytes.Length} {(WireProtocol.Crc32(bytes)^1u):x8}",now,0);
+        for(int i=0;i<bytes.Length;i+=32) receiver.Feed($"CAM DATA 5 {i} {Convert.ToHexString(bytes.AsSpan(i,Math.Min(32,bytes.Length-i)))}",now,1);
+        Assert.Throws<FormatException>(()=>receiver.Feed("CAM END 5",now,2));
     }
     [Fact]
     public void SpoolDoesNotOverwriteCommandAndControlDefaultsOff()
