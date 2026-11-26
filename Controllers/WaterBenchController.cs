@@ -55,6 +55,8 @@ public sealed class WaterBenchController : ControllerBase
     public IActionResult Command(BenchCommand request)
     {
         if(!Allowed())return Unauthorized();
+        if(_options.UseBackendSchedule&&request.Action=="scheduled")
+            return Conflict(new{message="Approve a synchronized schedule slot instead."});
         return _session.TryCommand(request,out var message)?Accepted(new{message}):Conflict(new{message});
     }
 }
