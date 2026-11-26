@@ -144,3 +144,5 @@ Opt-in separate WaterBench worker and local supervised API, bounded evidence spo
 P2.1.1: [Supervised daily water analysis schedule](docs/water-bench-schedule.md), Vietnam UTC+7, persistent due slots and no automatic replay. Operator approval required before UART dispatch.
 
 P2.1.2: [Boot-scoped UART ACK and clock observations](docs/water-bench-gateway.md). Pair with hardware gateway firmware.
+
+P2.2.2: optional backend-owned schedule sync, see [schedule documentation](docs/water-bench-schedule.md).

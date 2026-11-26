@@ -102,6 +102,11 @@ try
     {
         builder.Services.AddHostedService<WaterBenchWorker>();
         builder.Services.AddHostedService<BenchScheduleWorker>();
+        if(builder.Configuration.GetValue<bool>("WaterBench:UseBackendSchedule"))
+        {
+            builder.Services.AddHttpClient("water-bench-config").ConfigurePrimaryHttpMessageHandler(()=>new HttpClientHandler{AllowAutoRedirect=false});
+            builder.Services.AddHostedService<BackendBenchConfigurationWorker>();
+        }
     }
 
     var app = builder.Build();

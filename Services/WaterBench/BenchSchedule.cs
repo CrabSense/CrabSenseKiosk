@@ -7,7 +7,7 @@ public sealed record BenchScheduleSettings(bool Enabled,string[] Times,int Grace
 public sealed record BenchScheduleApproval(Guid SlotId);
 internal sealed record ScheduleSlot(Guid Id,DateTimeOffset DueUtc,DateTimeOffset ExpiresUtc,string State,string? Reason=null);
 internal sealed record ScheduleState(int Version,BenchScheduleSettings Settings,DateTimeOffset ChangedUtc,
-    DateTimeOffset? LastDueUtc,ScheduleSlot? Slot);
+    DateTimeOffset? LastDueUtc,ScheduleSlot? Slot,Guid? BackendStationId=null,int? BackendVersion=null,string? BackendHash=null);
 
 internal static class ScheduleCalendar
 {
@@ -68,6 +68,10 @@ public sealed class BenchSchedule : IDisposable
     private readonly DateTimeOffset _bootUtc;
     private bool _storageFault;
     private long _lastProbeMs;
+    private long? _backendObservedMs;
+    private string _backendState="not_synced";
+    private bool BackendFresh=>!_options.UseBackendSchedule||(_backendObservedMs is long ms&&Environment.TickCount64-ms<30000);
+    private bool EffectiveEnabled=>_state.Settings.Enabled&&BackendFresh;
     private static readonly JsonSerializerOptions Json=new(JsonSerializerDefaults.Web);
     internal BenchSchedule(WaterBenchOptions options,WaterBenchSession session,string directory,DateTimeOffset now)
     {
@@ -88,6 +92,8 @@ public sealed class BenchSchedule : IDisposable
                         state.Slot.ExpiresUtc<=state.Slot.DueUtc||state.Slot.State is not ("due" or "missed" or "expired" or "dispatch_attempt" or "sent_unconfirmed" or "blocked" or "interrupted"))))
                     throw new IOException("Invalid schedule journal.");
                 _state=state with {Settings=ScheduleCalendar.Validate(state.Settings)};
+                if(!options.UseBackendSchedule&&_state.BackendStationId is not null)
+                    Save(new(1,new(false,Array.Empty<string>()),now,now,null));
                 if(_state.Slot?.State is "due" or "dispatch_attempt")
                     Save(_state with {Slot=_state.Slot with {State="interrupted",Reason="restart_no_replay"}});
             }
@@ -116,6 +122,7 @@ public sealed class BenchSchedule : IDisposable
         {
             message="Schedule storage unavailable.";
             if(!_options.Enabled||_storageFault)return false;
+            if(_options.UseBackendSchedule){message="Backend owns the schedule.";return false;}
             BenchScheduleSettings valid;
             try{valid=ScheduleCalendar.Validate(settings);}
             catch(ArgumentException ex){message=ex.Message;return false;}
@@ -125,11 +132,55 @@ public sealed class BenchSchedule : IDisposable
             message="Saved; future slots only.";return true;
         }
     }
+    internal void BackendUnavailable(string reason)
+    {
+        lock(_gate)
+        {
+            _backendObservedMs=null;_backendState=reason;
+            if(_state.Slot is {State:"due"} slot)
+                Save(_state with {Slot=slot with {State="interrupted",Reason="backend_configuration_unavailable"}});
+        }
+    }
+    internal bool ApplyBackend(BackendBenchConfiguration config,DateTimeOffset now)
+    {
+        lock(_gate)
+        {
+            if(!_options.Enabled||!_options.UseBackendSchedule||_storageFault)return false;
+            if(config.StationId!=_options.BackendStationId||config.StationId==Guid.Empty||
+                config.MasterHardwareId!=_options.MasterHardwareId||config.SlaveHardwareId!=_options.SlaveHardwareId||
+                config.ConfigurationVersion<0||config.Timezone!="UTC+07:00"||config.Execution!="kiosk_supervised"||config.PhysicalDispatch||
+                (config.Enabled&&(!config.ConfiguredEnabled||!config.ProfilesReady||config.ConfigurationVersion==0)))
+            {BackendUnavailable("identity_or_configuration_mismatch");return false;}
+            BenchScheduleSettings valid;
+            string hash;
+            try
+            {
+                valid=ScheduleCalendar.Validate(new(config.Enabled,config.Times,config.GraceMinutes));
+                hash=config.ValidateAndHash();
+            }
+            catch(ArgumentException){BackendUnavailable("invalid_backend_configuration");return false;}
+            bool sameStation=_state.BackendStationId==config.StationId;
+            if(sameStation&&(_state.BackendVersion is int v&&(config.ConfigurationVersion<v||
+                (config.ConfigurationVersion==v&&_state.BackendHash!=hash))))
+            {BackendUnavailable("stale_or_changed_same_version");return false;}
+            bool changed=!sameStation||_state.BackendVersion!=config.ConfigurationVersion||_state.Settings.Enabled!=valid.Enabled||!BackendFresh;
+            if(changed)
+            {
+                var watermark=_state.LastDueUtc is { } previous&&previous>now?previous:now;
+                if(!Save(new(1,valid,now,watermark,null,config.StationId,config.ConfigurationVersion,hash)))
+                {BackendUnavailable("schedule_journal_failed");return false;}
+            }
+            _backendObservedMs=Environment.TickCount64;_backendState="synced";
+            return true;
+        }
+    }
     internal void Tick(DateTimeOffset utc)
     {
         lock(_gate)
         {
-            if(!_options.Enabled||_storageFault||!_state.Settings.Enabled)return;
+            if(!_options.Enabled||_storageFault)return;
+            if(!BackendFresh){if(_backendObservedMs is not null)BackendUnavailable("backend_configuration_expired");return;}
+            if(!_state.Settings.Enabled)return;
             if(_state.Slot is {State:"due"} old&&utc>=old.ExpiresUtc)
                 if(!Save(_state with {Slot=old with {State="expired",Reason="approval_window_elapsed"}}))return;
             var latest=ScheduleCalendar.Latest(_state.Settings,utc);
@@ -150,8 +201,8 @@ public sealed class BenchSchedule : IDisposable
     public object Snapshot(DateTimeOffset now)
     {
         lock(_gate)return new {
-            enabled=_options.Enabled&&!_storageFault&&_state.Settings.Enabled,storageHealthy=!_storageFault&&_lease is not null,
-            timezone="UTC+07:00 (Vietnam)",settings=_state.Settings,nextDueUtc=ScheduleCalendar.Next(_state.Settings,now),
+            enabled=_options.Enabled&&!_storageFault&&EffectiveEnabled,backendOwned=_options.UseBackendSchedule,backendState=_backendState,backendFresh=BackendFresh,backendStationId=_state.BackendStationId,backendVersion=_state.BackendVersion,storageHealthy=!_storageFault&&_lease is not null,
+            timezone="UTC+07:00 (Vietnam)",settings=_state.Settings,nextDueUtc=EffectiveEnabled?ScheduleCalendar.Next(_state.Settings,now):null,
             lastSlot=_state.Slot,approvalRequired=true,allAnalytesMask=7,
             readiness=_session.ScheduleReadiness(),autoReplay=false
         };
@@ -161,7 +212,7 @@ public sealed class BenchSchedule : IDisposable
         lock(_gate)
         {
             message="Slot unavailable.";
-            if(_storageFault||!_state.Settings.Enabled||_state.Slot is not {State:"due"} slot||
+            if(_storageFault||!EffectiveEnabled||_state.Slot is not {State:"due"} slot||
                 slot.Id!=slotId||now<slot.DueUtc||now>=slot.ExpiresUtc)return false;
             var reason=_session.ScheduleReadiness();
             if(reason!="ready"){message=reason;return false;}

@@ -5,6 +5,8 @@ public sealed class WaterBenchOptions
     public const string SectionName = "WaterBench";
     public bool Enabled { get; set; }
     public bool EnableSupervisedControl { get; set; }
+    public bool UseBackendSchedule { get; set; }
+    public Guid BackendStationId { get; set; }
     public string MasterPort { get; set; } = "";
     public string SlavePort { get; set; } = "";
     public string MasterHardwareId { get; set; } = "";
