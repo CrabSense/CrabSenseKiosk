@@ -62,7 +62,7 @@ public sealed class WaterBenchSession
         lock(_gate)
         {
             try { Handle(master,line); }
-            catch(Exception ex) when (ex is FormatException or JsonException or InvalidOperationException or KeyNotFoundException or OverflowException or IOException or ArgumentException or SixLabors.ImageSharp.UnknownImageFormatException or SixLabors.ImageSharp.InvalidImageContentException)
+            catch(Exception ex) when (ex is FormatException or JsonException or InvalidOperationException or KeyNotFoundException or OverflowException or IOException or ArgumentException or DllNotFoundException or EntryPointNotFoundException or BadImageFormatException or TypeInitializationException)
             { Fault("invalid_or_unstored_wire_evidence"); }
         }
     }

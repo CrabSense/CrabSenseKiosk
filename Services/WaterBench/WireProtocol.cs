@@ -1,8 +1,7 @@
 using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats.Jpeg;
+using SkiaSharp;
 
 namespace CrabSenseKiosk.Services.WaterBench;
 
@@ -45,14 +44,22 @@ internal static class WireProtocol
     }
     internal static void ValidateJpeg(byte[] bytes, int width, int height)
     {
-        if (bytes.Length < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 ||
+        if (bytes.Length < 4 || bytes.Length > MaxFrame || bytes[0] != 0xff || bytes[1] != 0xd8 ||
             bytes[^2] != 0xff || bytes[^1] != 0xd9) throw new FormatException("JPEG envelope.");
-        var info = Image.Identify(bytes);
-        if (info.Width != width || info.Height != height || (long)width * height > 1_000_000)
+        if (width <= 0 || height <= 0 || (long)width * height > 1_000_000)
             throw new FormatException("JPEG dimensions.");
-        if (Image.DetectFormat(bytes) is not JpegFormat) throw new FormatException("Not JPEG.");
-        using var image = Image.Load(bytes);
-        if (image.Width != width || image.Height != height) throw new FormatException("JPEG decode dimensions.");
+        using var data = SKData.CreateCopy(bytes);
+        using var codec = SKCodec.Create(data);
+        if (codec is null || codec.EncodedFormat != SKEncodedImageFormat.Jpeg)
+            throw new FormatException("Invalid JPEG header.");
+        if (codec.Info.Width != width || codec.Info.Height != height)
+            throw new FormatException("JPEG dimensions.");
+        // Bounded, full pixel decode. SKBitmap.Decode can return partial images;
+        // require an explicit Success result rather than just a non-null bitmap.
+        var info = new SKImageInfo(width, height, SKColorType.Rgba8888, SKAlphaType.Opaque);
+        var pixels = new byte[checked(width * height * 4)];
+        if (codec.GetPixels(info, pixels) != SKCodecResult.Success)
+            throw new FormatException("JPEG decode incomplete or invalid.");
     }
 }
 internal sealed record ReceivedFrame(uint CaptureId,uint Sequence,int Width,int Height,uint Crc,byte[] Bytes,DateTimeOffset ReceivedAt);
