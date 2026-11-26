@@ -74,6 +74,22 @@ public sealed class WaterBenchController : ControllerBase
         if(!Allowed())return Unauthorized();
         return _session.TryRecover(request,out var message)?Ok(new{message}):Conflict(new{message});
     }
+    [HttpGet("cleaning/runs")]
+    public IActionResult CleaningRuns([FromQuery]int skip=0,[FromQuery]int take=25)
+    {
+        if(!Allowed())return Unauthorized();
+        if(skip<0||skip>100000||take is <1 or >50)return BadRequest(new{message="Invalid page."});
+        Response.Headers.CacheControl="no-store";
+        return Ok(_session.CleaningRuns(skip,take));
+    }
+    [HttpGet("cleaning/runs/{runId:guid}")]
+    public IActionResult CleaningRun(Guid runId)
+    {
+        if(!Allowed())return Unauthorized();
+        if(runId==Guid.Empty)return BadRequest(new{message="Invalid run ID."});
+        Response.Headers.CacheControl="no-store";
+        return Ok(_session.CleaningRuns(0,1,runId));
+    }
     [HttpGet("commands")]
     public IActionResult Commands([FromQuery]int skip=0,[FromQuery]int take=25)
     {
