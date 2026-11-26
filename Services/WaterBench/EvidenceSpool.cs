@@ -41,6 +41,21 @@ internal sealed class EvidenceSpool
     }
     internal void Event(object value) => Put(Guid.NewGuid().ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal void Command(Guid id,object value) => Put("command-"+id.ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
+    internal bool HasCommand(Guid id)=>File.Exists(Path.Combine(_root,"command-"+id.ToString("N")+".json"));
+    internal void Outcome(Guid id,object value)=>Put("outcome-"+id.ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
+    internal object? CommandStatus(Guid id)
+    {
+        var attempt=Path.Combine(_root,"command-"+id.ToString("N")+".json");
+        var outcome=Path.Combine(_root,"outcome-"+id.ToString("N")+".json");
+        if(!File.Exists(attempt))return null;
+        static JsonElement Read(string path)
+        {
+            if(new FileInfo(path).Length>16384)throw new IOException("Command journal size.");
+            using var doc=JsonDocument.Parse(File.ReadAllBytes(path));return doc.RootElement.Clone();
+        }
+        return new {requestId=id,attempt=Read(attempt),outcome=File.Exists(outcome)?Read(outcome):(JsonElement?)null,
+            physicalCompletionConfirmed=false};
+    }
     internal string Frame(ReceivedFrame frame,object link)
     {
         var id = Guid.NewGuid().ToString("N");

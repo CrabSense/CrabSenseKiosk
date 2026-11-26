@@ -31,17 +31,23 @@ public sealed class WaterBenchWorker : BackgroundService
             using var linked=CancellationTokenSource.CreateLinkedTokenSource(ct);
             var readMaster=Task.Run(()=>Read(master,true,linked.Token),linked.Token);
             var readSlave=Task.Run(()=>Read(slave,false,linked.Token),linked.Token);
+            var maintenance=MaintainAsync(linked.Token);
             try
             {
                 // Only read-only identification probes. No automatic START or replay.
                 master.Write("inventory\n");slave.Write("inventory\n");
-                await Task.WhenAny(readMaster,readSlave);
+                await Task.WhenAny(readMaster,readSlave,maintenance);
             }
-            finally {linked.Cancel();try{await Task.WhenAll(readMaster,readSlave);}catch(OperationCanceledException) when(linked.IsCancellationRequested){}}
+            finally {linked.Cancel();try{await Task.WhenAll(readMaster,readSlave,maintenance);}catch(OperationCanceledException) when(linked.IsCancellationRequested){}}
         }
         catch(OperationCanceledException) when(ct.IsCancellationRequested){}
         catch(Exception ex){_log.LogError("Water bench serial session ended: {Type}",ex.GetType().Name);}
         finally{_session.Disconnected();}
+    }
+    private async Task MaintainAsync(CancellationToken ct)
+    {
+        using var timer=new PeriodicTimer(TimeSpan.FromMilliseconds(250));
+        while(await timer.WaitForNextTickAsync(ct))_session.Maintain();
     }
     private void Read(SerialPort port,bool master,CancellationToken ct)
     {
