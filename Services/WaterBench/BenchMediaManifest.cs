@@ -30,7 +30,7 @@ internal sealed record BenchMediaManifest(Guid StationId,Guid EventId,Guid Conne
             Convert.ToHexString(SHA256.HashData(frame.Bytes)).ToLowerInvariant(),frame.ReceivedAt,identity.RequestedAt,
             identity.MasterHardwareId,identity.SlaveHardwareId,frame.Bytes.Length,id.ToString("N")+".jpg");
     }
-    // Only the future ordered uploader calls this after selecting a committed manifest.
+    // The ordered uploader calls this only after selecting a committed manifest.
     internal object UploadBody(byte[] bytes)
     {
         if(EventId==Guid.Empty||LocalFile!=EventId.ToString("N")+".jpg"||SizeBytes!=bytes.Length||
