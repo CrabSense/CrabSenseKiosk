@@ -334,7 +334,7 @@ public sealed class WaterBenchSession
             master=_master,slave=_slave,batch=_batch,clean=_clean,nh3Sample=_sample,
             telemetry=_telemetry is null?null:new Dictionary<string,string>(_telemetry),telemetryReceivedAt=_telemetryAt,
             activeBatch=_activeBatch,startPending=_startPending,gatewayBootId=_boot,gatewayReady=_boot is not null&&!_fault,pendingCommandId=_pending?.Id,clockObservation=_clock,scheduleReadiness=ReadinessLocked(),savedCaptureIds=_saved.Keys.ToArray(),clockBasis="kiosk_receipt_not_exposure",
-            physicalAlignmentVerified=false,backendUploadImplemented=false
+            physicalAlignmentVerified=false,backendUploadImplemented=true
         };
     }
     private string ReadinessLocked()

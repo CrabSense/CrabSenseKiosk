@@ -29,7 +29,7 @@ internal static class BackendBenchBatchSync
         if(retry!=null)
         {
             retry.Reconcile(queue);
-            var status=retry.Status(now);queue.RetryStatus(status.Deferred,status.NextRetryAt,status.GlobalUntil);
+            var status=retry.Status(now);queue.RetryStatus(status.Deferred,status.NextRetryAt,status.GlobalUntil,retry.Entries());
             if(retry.GlobalPaused(now))return new("global_retry_wait");
         }
         var next=retry==null?(enabled.FirstOrDefault(x=>x.Kind=="batch")??enabled.FirstOrDefault(x=>x.Kind=="nh3")??enabled.FirstOrDefault(x=>x.Kind=="media")):
@@ -38,12 +38,16 @@ internal static class BackendBenchBatchSync
         if(next is null)return new(plan.InvalidFiles>0||plan.BlockedBatches>0?"queue_blocked":
             plan.Pending>0?(plan.Ready.Any(x=>x.Kind=="media")?"waiting_for_media":"waiting_for_nh3"):"idle");
         retry?.Begin(next,now);
+        if(retry!=null)
+        {
+            var status=retry.Status(now);queue.RetryStatus(status.Deferred,status.NextRetryAt,status.GlobalUntil,retry.Entries());
+        }
         var outcome=await SendCandidate(client,endpoint,secret,queue,next,ct);
         if(retry!=null)
         {
             retry.Finish(next,outcome,DateTimeOffset.UtcNow);
             var status=retry.Status(DateTimeOffset.UtcNow);
-            queue.RetryStatus(status.Deferred,status.NextRetryAt,status.GlobalUntil);
+            queue.RetryStatus(status.Deferred,status.NextRetryAt,status.GlobalUntil,retry.Entries());
         }
         return outcome;
     }

@@ -118,5 +118,6 @@ internal sealed class BenchSyncRetryJournal : IDisposable
         if(global.HasValue&&(next is null||next<global))next=global;
         return(deferred.Length,next,global);
     }
+    internal IReadOnlyList<BenchRetryEntry> Entries()=>_state.Entries.ToArray();
     public void Dispose()=>_lease.Dispose();
 }
