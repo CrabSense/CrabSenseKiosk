@@ -58,15 +58,24 @@ internal sealed class EvidenceSpool
         return new {requestId=id,attempt=Read(attempt),outcome=File.Exists(outcome)?Read(outcome):(JsonElement?)null,
             physicalCompletionConfirmed=false};
     }
-    internal string Frame(ReceivedFrame frame,object link)
+    internal string Frame(ReceivedFrame frame,object link,BenchMediaIdentity? identity=null)
     {
-        var id = Guid.NewGuid().ToString("N");
-        Put(id+".jpg",frame.Bytes);
-        Put(id+".json",JsonSerializer.SerializeToUtf8Bytes(new {
-            kind="jpeg", mediaId=id, sha256=Convert.ToHexString(SHA256.HashData(frame.Bytes)).ToLowerInvariant(),
+        var eventId=Guid.NewGuid();
+        var id=eventId.ToString("N");
+        var manifest=identity is null?null:BenchMediaManifest.Create(eventId,frame,identity);
+        // Manifest is the commit marker, written last. Orphan JPEG/raw metadata is never uploadable.
+        var manifestBytes=manifest is null?null:JsonSerializer.SerializeToUtf8Bytes(manifest,BenchMediaManifest.Json);
+        var rawBytes=JsonSerializer.SerializeToUtf8Bytes(new {
+            kind="jpeg",mediaId=id,sha256=Convert.ToHexString(SHA256.HashData(frame.Bytes)).ToLowerInvariant(),
             frame.CaptureId,frame.Sequence,frame.Width,frame.Height,frame.Crc,frame.ReceivedAt,link,
-            uploadState="pending", actualExposureVerified=false, chemicalAccuracyValidated=false
-        }));
+            uploadState="pending",actualExposureVerified=false,chemicalAccuracyValidated=false
+        });
+        if(_files+(manifestBytes is null?2:3)>_maxFiles||
+            frame.Bytes.LongLength+rawBytes.LongLength+(manifestBytes?.LongLength??0)>_maxBytes-_bytes)
+            throw new IOException("Water evidence spool full.");
+        Put(id+".jpg",frame.Bytes);
+        Put(id+".json",rawBytes);
+        if(manifestBytes is not null)Put("media-manifest-"+id+".json",manifestBytes);
         return id;
     }
 }
