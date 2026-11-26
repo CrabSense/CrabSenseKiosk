@@ -22,6 +22,7 @@ public sealed class WaterBenchSession
     private Dictionary<string,string>? _telemetry;
     private DateTimeOffset? _telemetryAt;
     private string? _activeBatch;
+    private BatchObservationJournal? _timeline;
     private bool _fault;
     private Guid _connection;
     private string? _error;
@@ -45,7 +46,7 @@ public sealed class WaterBenchSession
     {
         lock(_gate)
         {
-            _connection=Guid.NewGuid(); _write=write;
+            _connection=Guid.NewGuid(); _write=write; _timeline=null;
             _master=_slave=_batch=_clean=_sample=null; _telemetry=null; _telemetryAt=null;
             _activeBatch=null; _startPending=false; _boot=null; _clock=null; _helloNonce=Guid.Empty; _pending=null; _lastSequence=0; _batchAtMs=_cleanAtMs=_telemetryAtMs=0; _sessions.Clear(); _links.Clear(); _frames.Clear(); _saved.Clear(); _camera.Reset();
             // Reconnect never silently releases prior uncertain state.
@@ -57,6 +58,7 @@ public sealed class WaterBenchSession
         lock(_gate)
         {
             if (_activeBatch is not null || _write is not null) { _fault=true; _error="connection_lost_inspect_before_restart"; }
+            InterruptTimeline("disconnect");
             EndUnknown("disconnect");
             _write=null; _master=_slave=null; _boot=null; _clock=null; _camera.Reset(); _links.Clear(); _frames.Clear(); _saved.Clear();
             try { Store("connection_closed",new { reason=_error }); } catch(IOException) { }
@@ -73,7 +75,17 @@ public sealed class WaterBenchSession
         try{_spool.Outcome(p.Id,new {state="unknown",reason,connection=_connection,bootId=_boot,sequence=p.Seq,at=DateTimeOffset.UtcNow});}
         catch(Exception ex) when(ex is IOException or UnauthorizedAccessException){}
     }
-    private void Fault(string error) { EndUnknown(error);_fault=true;_error=error;_camera.Reset();_frames.Clear(); }
+    private void InterruptTimeline(string reason)
+    {
+        try{_timeline?.Interrupt(reason,DateTimeOffset.UtcNow);}
+        catch(Exception ex) when(ex is IOException or UnauthorizedAccessException){_fault=true;_error="batch_timeline_storage_failed";}
+    }
+    private void Fault(string error)
+    {
+        // Firmware fault line is followed by a structured terminal status.
+        if(error!="firmware_reported_fault"&&error!="firmware_batch_fault")InterruptTimeline(error);
+        EndUnknown(error);_fault=true;_error=error;_camera.Reset();_frames.Clear();
+    }
     private void SendHelloLocked()
     {
         if(!Identified||_fault||_pending is not null||_helloNonce!=Guid.Empty)return;
@@ -181,6 +193,12 @@ public sealed class WaterBenchSession
         {
             var p=line.Split(' ',StringSplitOptions.RemoveEmptyEntries);
             if(p.Length!=5||!WireProtocol.BatchId(p[2])||_activeBatch is not null)throw new FormatException("Unexpected batch start.");
+            if(_options.BackendStationId!=Guid.Empty)
+            {
+                if(_boot is null)throw new FormatException("Batch start without gateway boot identity.");
+                _timeline=new BatchObservationJournal(_options.BackendStationId,_connection,_boot,_spool);
+                _timeline.Start(line,_pending is {Action:"manual" or "scheduled"} pending?pending.Id:null,utc);
+            }
             _activeBatch=p[2];_startPending=false;_sessions.Clear();_saved.Clear();_links.Clear();_frames.Clear();_camera.Reset();
             Store("batch_start",line);return;
         }
@@ -191,7 +209,11 @@ public sealed class WaterBenchSession
             if(b!=_activeBatch||b is null||a is not ("NO2" or "NO3" or "NH3")||session is null||
                 (a=="NH3"?!WireProtocol.BatchId(session):session!=b+(a=="NO2"?"-1":"-2"))||!_sessions.TryAdd(a,session))
                 throw new FormatException("Session mismatch.");
-            Store("session",e);return;
+            _timeline?.Session(e,utc);Store("session",e);return;
+        }
+        if(line.StartsWith("BATCH REACTION ",StringComparison.Ordinal))
+        {
+            _timeline?.Reaction(line,utc);Store("operator_event",line);return;
         }
         if(line.StartsWith("BATCH IMAGE ",StringComparison.Ordinal))
         {
@@ -201,14 +223,14 @@ public sealed class WaterBenchSession
             if(b!=_activeBatch||b is null||a is null||sid is null||!_sessions.TryGetValue(a,out var expected)||sid!=expected||
                 id is 0 or >65536||_saved.ContainsKey(id)||_links.Count>=3||!_links.TryAdd(id,new(b,a,sid,id,utc,now)))
                 throw new FormatException("Image request mismatch.");
-            Store("image_request",e);Pair(id);return;
+            _timeline?.Image(e,utc);Store("image_request",e);Pair(id);return;
         }
         if(line.StartsWith("BATCH STATUS ",StringComparison.Ordinal))
         {
             var e=WireProtocol.Json(line[13..]);int state=e.GetProperty("state").GetInt32();
             if(state<0||state>3)throw new FormatException("Batch state.");
             if(state==1&&e.GetProperty("batch_id").GetString()!=_activeBatch)Fault("unknown_running_batch");
-            _batch=e;_batchAtMs=now;Store("batch_status",e);
+            _timeline?.Status(e,utc);_batch=e;_batchAtMs=now;Store("batch_status",e);
             if(state==3)Fault("firmware_batch_fault");
             return;
         }
@@ -236,6 +258,7 @@ public sealed class WaterBenchSession
         }
         if(line.StartsWith("BATCH RESET",StringComparison.Ordinal))
         {
+            InterruptTimeline("reset_before_terminal_status");_timeline=null;
             _activeBatch=null;_sessions.Clear();_links.Clear();_frames.Clear();_saved.Clear();_camera.Reset();Store("operator_event",line);return;
         }
         // Only a matching structured ACK may resolve a command. Human-readable REJECT is evidence only.
