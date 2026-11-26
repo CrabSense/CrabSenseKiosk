@@ -21,6 +21,26 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
     private string _transportState="disabled";
     private DateTimeOffset? _lastAttemptAt,_lastReceiptAt;
     private int? _lastHttpStatus;
+    private int _deferredBatches;
+    private DateTimeOffset? _nextRetryAt,_globalRetryUntil;
+    internal string RetryDirectory=>Path.Combine(spool.Root,"sync-retry");
+    internal void RetryStatus(int deferred,DateTimeOffset? next,DateTimeOffset? global)
+    {
+        lock(_gate){_deferredBatches=deferred;_nextRetryAt=next;_globalRetryUntil=global;}
+    }
+    internal bool HasVerifiedReceipt(Guid id,string kind,string localSha256)
+    {
+        lock(_gate)
+        {
+            try
+            {
+                string prefix=kind switch{"batch"=>"batch-timeline-","media"=>"media-manifest-","nh3"=>"nh3-evidence-",_=>throw new IOException("Unknown sync kind.")};
+                var e=Load(prefix+id.ToString("N")+".json");
+                return e.Ack&&e.Candidate.StationId==station&&e.Candidate.LocalSha256==localSha256;
+            }
+            catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or JsonException or FormatException or ArgumentException){return false;}
+        }
+    }
     internal void TransportStatus(string state,DateTimeOffset? attempt=null,DateTimeOffset? receipt=null,int? httpStatus=null)
     {
         lock(_gate)
@@ -245,7 +265,8 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
             return new{p.State,p.Pending,p.Acknowledged,p.Foreign,p.BlockedBatches,p.InvalidFiles,readyBatches=p.Ready.Select(x=>(x.BootId,x.BatchId)).Distinct().Count(),
                 stationId=station,automaticUploadImplemented=true,batchSyncEnabled,mediaSyncEnabled=batchSyncEnabled&&mediaSyncEnabled,nh3SyncEnabled=batchSyncEnabled&&nh3SyncEnabled,
                 transportState=batchSyncEnabled?_transportState:"disabled",lastAttemptAt=_lastAttemptAt,lastReceiptAt=_lastReceiptAt,
-                lastHttpStatus=_lastHttpStatus,rawEvidenceRetained=true,physicalCommandsReplayed=false};
+                lastHttpStatus=_lastHttpStatus,deferredBatches=_deferredBatches,nextRetryAt=_nextRetryAt,globalRetryUntil=_globalRetryUntil,
+                rawEvidenceRetained=true,physicalCommandsReplayed=false};
         }
     }
 }
