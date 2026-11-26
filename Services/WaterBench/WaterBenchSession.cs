@@ -271,7 +271,14 @@ public sealed class WaterBenchSession
     {
         if(_fault||!_links.TryGetValue(id,out var link)||!_frames.TryGetValue(id,out var frame))return;
         if(Math.Abs((frame.ReceivedAt-link.At).TotalSeconds)>60)throw new FormatException("Capture outside request window.");
-        string mediaId=_spool.Frame(frame,link);
+        BenchMediaIdentity? identity=null;
+        if(_options.BackendStationId!=Guid.Empty)
+        {
+            if(_boot is null||_activeBatch!=link.Batch||!Identified)throw new FormatException("Missing capture scope.");
+            identity=new(_options.BackendStationId,_connection,_boot,link.Batch,link.Analyte,link.Session,link.At,
+                _options.MasterHardwareId,_options.SlaveHardwareId);
+        }
+        string mediaId=_spool.Frame(frame,link,identity);
         _saved.Add(id,(mediaId,link.Analyte));_links.Remove(id);_frames.Remove(id);
     }
     public object Snapshot()
