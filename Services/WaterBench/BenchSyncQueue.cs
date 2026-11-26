@@ -174,7 +174,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         if(e.Batch!=null)return e.Batch;
         return e.Media!.UploadBody(ReadBounded(PathFor(e.Media.LocalFile),WireProtocol.MaxFrame));
     }
-    // Called only by the future authenticated transport, never a public/local HTTP mutation.
+    // Called only by authenticated transport, never a public/local HTTP mutation.
     internal void Accept(BenchSyncCandidate candidate,BenchSyncServerReceipt server,DateTimeOffset at)
     {
         lock(_gate)
@@ -208,13 +208,13 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
             spool.PutReceipt(candidate.EventId,JsonSerializer.SerializeToUtf8Bytes(row,Json));
         }
     }
-    internal object Snapshot(bool batchSyncEnabled=false)
+    internal object Snapshot(bool batchSyncEnabled=false,bool mediaSyncEnabled=false)
     {
         lock(_gate)
         {
             var p=ScanLocked();
             return new{p.State,p.Pending,p.Acknowledged,p.Foreign,p.BlockedBatches,p.InvalidFiles,readyBatches=p.Ready.Count,
-                stationId=station,automaticUploadImplemented=true,batchSyncEnabled,mediaSyncEnabled=false,
+                stationId=station,automaticUploadImplemented=true,batchSyncEnabled,mediaSyncEnabled=batchSyncEnabled&&mediaSyncEnabled,
                 transportState=batchSyncEnabled?_transportState:"disabled",lastAttemptAt=_lastAttemptAt,lastReceiptAt=_lastReceiptAt,
                 lastHttpStatus=_lastHttpStatus,rawEvidenceRetained=true,physicalCommandsReplayed=false};
         }

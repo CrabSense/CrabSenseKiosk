@@ -106,7 +106,8 @@ try
         {
             builder.Services.AddHttpClient("water-bench-batch-sync",c=>
             {
-                c.Timeout=TimeSpan.FromSeconds(8);
+                // Per-request deadlines are enforced by the sync worker (8s event / 60s media).
+                c.Timeout=TimeSpan.FromSeconds(65);
                 c.MaxResponseContentBufferSize=16384;
             }).ConfigurePrimaryHttpMessageHandler(()=>new HttpClientHandler{AllowAutoRedirect=false,UseCookies=false});
             builder.Services.AddHostedService<BackendBenchBatchSyncWorker>();
