@@ -56,7 +56,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         ??throw new IOException("Invalid spool JSON.");
     private static bool Identity(Guid id,Guid station,Guid connection,string boot,string batch,DateTimeOffset at)=>
         id!=Guid.Empty&&station!=Guid.Empty&&connection!=Guid.Empty&&WireProtocol.BatchId(boot)&&WireProtocol.BatchId(batch)&&at!=default;
-    private sealed record Entry(BenchSyncCandidate Candidate,BenchBatchEvent? Batch,BenchMediaManifest? Media,bool Ack);
+    private sealed record Entry(BenchSyncCandidate Candidate,BenchBatchEvent? Batch,BenchMediaManifest? Media,bool Ack,Nh3EvidenceEvent? Nh3=null);
     private static bool ValidAck(BenchSyncCandidate c,BenchSyncReceipt r)=>
         r.EventId==c.EventId&&r.Kind==c.Kind&&r.LocalSha256==c.LocalSha256&&r.ReceiptId!=Guid.Empty&&r.RecordedAt!=default&&
         (c.Kind=="media"?(r.MediaId.HasValue&&r.MediaId!=Guid.Empty&&r.Sha256==c.ImageSha256):
@@ -64,9 +64,11 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
     private Entry Load(string name)
     {
         bool isBatch=TryFileId(name,"batch-timeline-",out var id);
-        if(!isBatch&&!TryFileId(name,"media-manifest-",out id))throw new IOException("Invalid spool filename.");
+        bool isNh3=!isBatch&&TryFileId(name,"nh3-evidence-",out id);
+        if(isBatch)_=TryFileId(name,"batch-timeline-",out id);
+        if(!isBatch&&!isNh3&&!TryFileId(name,"media-manifest-",out id))throw new IOException("Invalid spool filename.");
         var bytes=ReadBounded(PathFor(name),MaxMetadata);
-        BenchBatchEvent? batch=null;BenchMediaManifest? media=null;BenchSyncCandidate c;
+        BenchBatchEvent? batch=null;BenchMediaManifest? media=null;Nh3EvidenceEvent? nh3=null;BenchSyncCandidate c;
         if(isBatch)
         {
             batch=Parse<BenchBatchEvent>(bytes);
@@ -74,6 +76,12 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
                 batch.Sequence is <1 or >512||batch.Type is not ("start" or "session" or "reaction" or "image" or "status" or "interrupted"))
                 throw new IOException("Invalid batch event identity.");
             c=new(id,"batch",Hash(bytes),batch.StationId,batch.BootId,batch.BatchId,batch.ConnectionId,batch.ReceivedAt,batch.Sequence);
+        }
+        else if(isNh3)
+        {
+            nh3=Parse<Nh3EvidenceEvent>(bytes);Nh3EvidencePolicy.Validate(nh3);
+            if(nh3.EventId!=id)throw new IOException("Invalid NH3 event identity.");
+            c=new(id,"nh3",Hash(bytes),nh3.StationId,nh3.BootId,nh3.BatchId,nh3.ConnectionId,nh3.ReceivedAt,null);
         }
         else
         {
@@ -97,7 +105,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         var receiptPath=PathFor(ReceiptName(id));bool ack=File.Exists(receiptPath);
         if(ack&&!ValidAck(c,Parse<BenchSyncReceipt>(ReadBounded(receiptPath,EvidenceSpool.ReceiptBudget))))
             throw new IOException("Receipt does not match immutable evidence.");
-        return new(c,batch,media,ack);
+        return new(c,batch,media,ack,nh3);
     }
     internal BenchSyncPlan Scan()
     {
@@ -119,7 +127,8 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
                     if(!TryFileId(name,"sync-receipt-",out var receiptId)||!receipts.Add(receiptId))invalid++;
                     continue;
                 }
-                if(!name.StartsWith("batch-timeline-",StringComparison.Ordinal)&&!name.StartsWith("media-manifest-",StringComparison.Ordinal))continue;
+                if(!name.StartsWith("batch-timeline-",StringComparison.Ordinal)&&!name.StartsWith("media-manifest-",StringComparison.Ordinal)&&
+                    !name.StartsWith("nh3-evidence-",StringComparison.Ordinal))continue;
                 try{entries.Add(Load(name));}
                 catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or JsonException or FormatException or ArgumentException){invalid++;}
             }
@@ -139,21 +148,39 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         {
             var rows=group.Where(x=>x.Batch!=null).OrderBy(x=>x.Batch!.Sequence).ToArray();
             var media=group.Where(x=>x.Media!=null).OrderBy(x=>x.Candidate.ReceivedAt).ThenBy(x=>x.Candidate.EventId).ToArray();
+            var nh3=group.Where(x=>x.Nh3!=null).OrderBy(x=>x.Nh3!.Type=="sample"?0:1).ThenBy(x=>x.Candidate.ReceivedAt).ToArray();
             var first=rows.FirstOrDefault();
             if(first is null||first.Batch!.Type!="start"||rows.Length>512||
                 group.Any(x=>x.Candidate.ConnectionId!=first.Candidate.ConnectionId)||
                 rows.Where((r,i)=>r.Batch!.Sequence!=i+1||(i>0&&r.Batch.Type=="start")).Any()||
                 rows.SkipWhile(r=>r.Ack).Any(r=>r.Ack)||
-                media.GroupBy(x=>(x.Media!.Analyte,x.Media.SessionId,x.Media.CaptureId)).Any(g=>g.Count()!=1))
+                media.GroupBy(x=>(x.Media!.Analyte,x.Media.SessionId,x.Media.CaptureId)).Any(g=>g.Count()!=1)||
+                nh3.GroupBy(x=>(x.Nh3!.SessionId,x.Nh3.Type)).Any(g=>g.Count()!=1))
             {blocked++;continue;}
             bool Matches(Entry r,Entry m)=>r.Batch!.Type=="image"&&r.Batch.Analyte==m.Media!.Analyte&&
                 r.Batch.SessionId==m.Media.SessionId&&r.Batch.CaptureId==m.Media.CaptureId&&
                 Math.Abs((r.Batch.ReceivedAt-m.Media.RequestedAt).TotalSeconds)<=2;
             if(media.Any(m=>rows.Count(r=>Matches(r,m))!=1||m.Ack&&!rows.Any(r=>r.Ack&&Matches(r,m))))
             {blocked++;continue;}
-            // At most one candidate per batch: all currently committed timeline events first.
-            var next=rows.FirstOrDefault(x=>!x.Ack)??media.FirstOrDefault(x=>!x.Ack);
+            bool SessionMatches(Entry row,Nh3EvidenceEvent n)=>row.Batch!.Type=="session"&&row.Batch.Analyte=="NH3"&&
+                row.Batch.SessionId==n.SessionId&&n.ReceivedAt>=row.Batch.ReceivedAt.AddSeconds(-2);
+            bool ImageMatches(Entry row,Nh3EvidenceEvent n)=>row.Batch!.Type=="image"&&row.Batch.Analyte=="NH3"&&
+                row.Batch.SessionId==n.SessionId&&row.Batch.CaptureId==n.Image?.CaptureId&&
+                Math.Abs((row.Batch.ReceivedAt-n.ReceivedAt).TotalSeconds)<=2;
+            if(nh3.Any(n=>rows.Count(r=>SessionMatches(r,n.Nh3!))!=1||
+                (n.Nh3!.Type=="image_link"&&rows.Count(r=>ImageMatches(r,n.Nh3))!=1)||
+                (n.Ack&&(!rows.Any(r=>r.Ack&&SessionMatches(r,n.Nh3))||
+                    (n.Nh3.Type=="image_link"&&!rows.Any(r=>r.Ack&&ImageMatches(r,n.Nh3)))))))
+            {blocked++;continue;}
+            // One timeline candidate per batch. After the timeline prefix is acknowledged,
+            // expose at most one candidate of each optional stream so disabled NH3 cannot block JPEGs.
+            var next=rows.FirstOrDefault(x=>!x.Ack);
             if(next!=null)ready.Add(next.Candidate);
+            else
+            {
+                var n=nh3.FirstOrDefault(x=>!x.Ack);if(n!=null)ready.Add(n.Candidate);
+                var m=media.FirstOrDefault(x=>!x.Ack);if(m!=null)ready.Add(m.Candidate);
+            }
         }
         return new(pending,acked,foreign,blocked,invalid,ready.OrderBy(x=>x.ReceivedAt).ThenBy(x=>x.EventId).ToArray(),
             blocked>0?"blocked_batches":pending>0?"pending":"idle");
@@ -168,10 +195,12 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
     }
     private object PrepareLocked(BenchSyncCandidate c)
     {
-        string name=(c.Kind=="batch"?"batch-timeline-":"media-manifest-")+c.EventId.ToString("N")+".json";
+        string prefix=c.Kind switch{"batch"=>"batch-timeline-","media"=>"media-manifest-","nh3"=>"nh3-evidence-",_=>throw new IOException("Unknown sync kind.")};
+        string name=prefix+c.EventId.ToString("N")+".json";
         var e=Load(name);
         if(e.Candidate!=c)throw new IOException("Evidence changed.");
         if(e.Batch!=null)return e.Batch;
+        if(e.Nh3!=null)return e.Nh3;
         return e.Media!.UploadBody(ReadBounded(PathFor(e.Media.LocalFile),WireProtocol.MaxFrame));
     }
     // Called only by authenticated transport, never a public/local HTTP mutation.
@@ -208,13 +237,13 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
             spool.PutReceipt(candidate.EventId,JsonSerializer.SerializeToUtf8Bytes(row,Json));
         }
     }
-    internal object Snapshot(bool batchSyncEnabled=false,bool mediaSyncEnabled=false)
+    internal object Snapshot(bool batchSyncEnabled=false,bool mediaSyncEnabled=false,bool nh3SyncEnabled=false)
     {
         lock(_gate)
         {
             var p=ScanLocked();
-            return new{p.State,p.Pending,p.Acknowledged,p.Foreign,p.BlockedBatches,p.InvalidFiles,readyBatches=p.Ready.Count,
-                stationId=station,automaticUploadImplemented=true,batchSyncEnabled,mediaSyncEnabled=batchSyncEnabled&&mediaSyncEnabled,
+            return new{p.State,p.Pending,p.Acknowledged,p.Foreign,p.BlockedBatches,p.InvalidFiles,readyBatches=p.Ready.Select(x=>(x.BootId,x.BatchId)).Distinct().Count(),
+                stationId=station,automaticUploadImplemented=true,batchSyncEnabled,mediaSyncEnabled=batchSyncEnabled&&mediaSyncEnabled,nh3SyncEnabled=batchSyncEnabled&&nh3SyncEnabled,
                 transportState=batchSyncEnabled?_transportState:"disabled",lastAttemptAt=_lastAttemptAt,lastReceiptAt=_lastReceiptAt,
                 lastHttpStatus=_lastHttpStatus,rawEvidenceRetained=true,physicalCommandsReplayed=false};
         }

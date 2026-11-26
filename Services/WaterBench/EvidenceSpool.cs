@@ -27,7 +27,7 @@ internal sealed class EvidenceSpool
             _files++;
             _bytes += new FileInfo(path).Length;
             var name=Path.GetFileName(path);
-            if((BenchSyncQueue.TryFileId(name,"batch-timeline-",out var id)||BenchSyncQueue.TryFileId(name,"media-manifest-",out id))&&
+            if((BenchSyncQueue.TryFileId(name,"batch-timeline-",out var id)||BenchSyncQueue.TryFileId(name,"media-manifest-",out id)||BenchSyncQueue.TryFileId(name,"nh3-evidence-",out id))&&
                 !File.Exists(Path.Combine(_root,BenchSyncQueue.ReceiptName(id))))_reservedReceipts.Add(id);
         }
     }
@@ -73,6 +73,8 @@ internal sealed class EvidenceSpool
     }
     internal void BatchEvent(BenchBatchEvent value) => PutQueued("batch-timeline-"+value.EventId.ToString("N")+".json",value.EventId,
         JsonSerializer.SerializeToUtf8Bytes(value,new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+    internal void Nh3Event(Nh3EvidenceEvent value)=>PutQueued("nh3-evidence-"+value.EventId.ToString("N")+".json",value.EventId,
+        JsonSerializer.SerializeToUtf8Bytes(value,BenchMediaManifest.Json));
     internal void Event(object value) => Put(Guid.NewGuid().ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal void Command(Guid id,object value) => Put("command-"+id.ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal bool HasCommand(Guid id)=>File.Exists(Path.Combine(_root,"command-"+id.ToString("N")+".json"));
