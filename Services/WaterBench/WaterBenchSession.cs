@@ -27,6 +27,8 @@ public sealed class WaterBenchSession
     private BenchCleaningJournal? _cleanJournal;
     private Nh3EvidenceEvent? _nh3SampleEvent,_nh3ImageEvent;
     private bool _fault;
+    private bool _historicalRecoveryFailed;
+    private int _recoveredBatches;
     private Guid _connection;
     private string? _error;
     private long _lastTelemetryStored,_batchAtMs,_cleanAtMs,_telemetryAtMs;
@@ -51,7 +53,14 @@ public sealed class WaterBenchSession
         // was interrupted or the previous process could not persist a fault.
         if(options.Enabled&&options.EnableSupervisedControl)
         {_fault=true;_error="startup_inspection_required";}
+        if(options.Enabled)
+        {
+            try{_recoveredBatches=spool.RecoverInterruptedBatches(options.BackendStationId,DateTimeOffset.UtcNow);}
+            catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or JsonException or FormatException or InvalidOperationException or ArgumentException)
+            {_historicalRecoveryFailed=true;_fault=true;_error="historical_batch_recovery_failed";}
+        }
     }
+    internal void StageAudits(){lock(_gate)_spool.StageAudits(_options.BackendStationId);}
     public object SyncStatus()=>SyncQueue.Snapshot(_options.Enabled&&_options.EnableBatchSync,_options.EnableMediaSync,_options.EnableNh3EvidenceSync);
 
     internal void Connected(Action<string> write)
@@ -149,6 +158,7 @@ public sealed class WaterBenchSession
     private string RecoveryReadinessLocked()
     {
         if(!_options.Enabled||!_options.EnableSupervisedControl)return "supervised_control_disabled";
+        if(_historicalRecoveryFailed)return "historical_batch_recovery_failed";
         if(!_fault)return "inspection_not_required";
         if(!Identified||_pending!=null||_helloNonce!=Guid.Empty)return "identified_idle_connection_required";
         if(_activeBatch!=null||_timeline?.Active==true)return "held_batch_requires_local_reset";
@@ -433,7 +443,7 @@ public sealed class WaterBenchSession
         lock(_gate)return new {
             enabled=_options.Enabled,controlEnabled=_options.EnableSupervisedControl,connection=_connection,
             identified=Identified,recoveryRequired=_fault,error=_error,recoveryReadiness=RecoveryReadinessLocked(),
-            startupInspectionRequired=true,spoolCapacity=_spool.HasCapacity,
+            startupInspectionRequired=true,historicalBatchRecoveryFailed=_historicalRecoveryFailed,recoveredBatches=_recoveredBatches,spoolCapacity=_spool.HasCapacity,
             master=_master,slave=_slave,batch=_batch,clean=_clean,nh3Sample=_sample,
             cleaningRunId=_cleanJournal?.RunId,cleaningJournalState=_cleanJournal?.State,physicalCleaningVerified=false,
             telemetry=_telemetry is null?null:new Dictionary<string,string>(_telemetry),telemetryReceivedAt=_telemetryAt,

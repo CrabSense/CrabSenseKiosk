@@ -21,7 +21,7 @@ internal sealed class BatchObservationJournal(Guid station,Guid connection,strin
     private BenchBatchEvent New(string type,DateTimeOffset at)=>new(station,Guid.NewGuid(),connection,boot,_batch!,_seq+1,type,at);
     private void Write(BenchBatchEvent e)
     {
-        if(e.Sequence>512)throw new IOException("Batch timeline capacity reached.");
+        if(e.Sequence>512||e.Sequence==512&&e.Type!="interrupted"&&!(e.Type=="status"&&e.State is 2 or 3))throw new IOException("Batch timeline capacity reached.");
         spool.BatchEvent(e);_seq=e.Sequence;
     }
     internal void Start(string line,Guid? request,DateTimeOffset at)
