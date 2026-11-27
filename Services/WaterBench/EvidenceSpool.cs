@@ -29,7 +29,7 @@ internal sealed class EvidenceSpool
             _files++;
             _bytes += new FileInfo(path).Length;
             var name=Path.GetFileName(path);
-            if((BenchSyncQueue.TryFileId(name,"batch-timeline-",out var id)||BenchSyncQueue.TryFileId(name,"media-manifest-",out id)||BenchSyncQueue.TryFileId(name,"nh3-evidence-",out id))&&
+            if((BenchSyncQueue.TryFileId(name,"batch-timeline-",out var id)||BenchSyncQueue.TryFileId(name,"media-manifest-",out id)||BenchSyncQueue.TryFileId(name,"nh3-evidence-",out id)||BenchSyncQueue.TryFileId(name,"audit-event-",out id))&&
                 !File.Exists(Path.Combine(_root,BenchSyncQueue.ReceiptName(id))))_reservedReceipts.Add(id);
             if(BenchSyncQueue.TryFileId(name,"command-",out var commandId)&&
                 !File.Exists(Path.Combine(_root,"outcome-"+commandId.ToString("N")+".json")))_reservedOutcomes.Add(commandId);
@@ -86,6 +86,94 @@ internal sealed class EvidenceSpool
         JsonSerializer.SerializeToUtf8Bytes(value,new JsonSerializerOptions(JsonSerializerDefaults.Web)));
     internal void Nh3Event(Nh3EvidenceEvent value)=>PutQueued("nh3-evidence-"+value.EventId.ToString("N")+".json",value.EventId,
         JsonSerializer.SerializeToUtf8Bytes(value,BenchMediaManifest.Json));
+    // Materialize validated historical journals as durable outbox events. Original bytes remain immutable.
+    internal void StageAudits(Guid station)
+    {
+        if(station==Guid.Empty)return;
+        lock(_gate)
+        {
+            var files=Directory.EnumerateFiles(_root).Take(100001).ToArray();
+            if(files.Length>100000)throw new IOException("Audit scan limit.");
+            void Stage(BenchAuditEvent e)
+            {
+                e.Validate();
+                string name="audit-event-"+e.EventId.ToString("N")+".json";
+                byte[] bytes=JsonSerializer.SerializeToUtf8Bytes(e,BenchMediaManifest.Json);
+                var path=Path.Combine(_root,name);
+                if(File.Exists(path))
+                {
+                    if(!BenchCommandAudit.Read(path,32768).SequenceEqual(bytes))throw new IOException("Audit event changed.");
+                    return;
+                }
+                PutQueued(name,e.EventId,bytes);
+            }
+            foreach(var file in files)
+            {
+                if(!BenchSyncQueue.TryFileId(Path.GetFileName(file),"command-",out var id))continue;
+                var view=BenchCommandAudit.Inspect(_root,id,null);
+                if(view.State=="legacy_unverified")continue;
+                if(view.State=="invalid_journal")throw new IOException("Invalid command audit.");
+                if(view.StationId!=station)continue;
+                var a=BenchCommandAudit.Read(file,16384);
+                Stage(BenchAuditEvent.Create(station,view.ConnectionId!.Value,view.BootId!,"command",id,0,view.AttemptAt!.Value,a));
+                if(view.Outcome.HasValue)
+                {
+                    var o=BenchCommandAudit.Read(Path.Combine(_root,"outcome-"+id.ToString("N")+".json"),16384);
+                    Stage(BenchAuditEvent.Create(station,view.ConnectionId.Value,view.BootId!,"command_outcome",id,0,view.OutcomeAt!.Value,o));
+                }
+            }
+            var clean=files.Where(f=>Path.GetFileName(f).StartsWith("clean-audit-",StringComparison.Ordinal))
+                .Select(f=>(Path:f,Bytes:BenchCommandAudit.Read(f,4096)))
+                .Select(f=>(f.Path,f.Bytes,Event:BenchCommandAudit.Object(f.Bytes).Deserialize<BenchCleanEvent>(BenchMediaManifest.Json)
+                    ??throw new FormatException("Cleaning event."))).ToArray();
+            foreach(var group in clean.GroupBy(x=>x.Event.RunId))
+            {
+                var timeline=new BenchCleanTimeline();
+                foreach(var row in group.OrderBy(x=>x.Event.Sequence))
+                {
+                    var e=row.Event;
+                    if(Path.GetFileName(row.Path)!=BenchCleaningInventory.Name(e.RunId,e.Sequence))throw new FormatException("Cleaning filename.");
+                    timeline.Apply(e);
+                    if(e.StationId==station)Stage(BenchAuditEvent.Create(station,e.ConnectionId,e.BootId,"clean_status",e.RunId,e.Sequence,e.At,row.Bytes));
+                }
+            }
+        }
+    }
+    internal int RecoverInterruptedBatches(Guid station,DateTimeOffset at)
+    {
+        if(station==Guid.Empty)return 0;
+        lock(_gate)
+        {
+            var files=Directory.EnumerateFiles(_root).Take(100001).ToArray();
+            if(files.Length>100000)throw new IOException("Recovery scan limit.");
+            var events=new List<BenchBatchEvent>();
+            foreach(var file in files.Where(f=>Path.GetFileName(f).StartsWith("batch-timeline-",StringComparison.Ordinal)))
+            {
+                var e=BenchCommandAudit.Object(BenchCommandAudit.Read(file,16384)).Deserialize<BenchBatchEvent>(BenchMediaManifest.Json)
+                    ??throw new FormatException("Batch event.");
+                if(!BenchSyncQueue.TryFileId(Path.GetFileName(file),"batch-timeline-",out var id)||id!=e.EventId)
+                    throw new FormatException("Batch event identity.");
+                if(e.StationId==station)events.Add(e);
+            }
+            int recovered=0;
+            foreach(var group in events.GroupBy(e=>(e.BootId,e.BatchId)))
+            {
+                var rows=group.OrderBy(e=>e.Sequence).ToArray();
+                var first=rows[0];var last=rows[^1];
+                if(!WireProtocol.BatchId(first.BootId)||!WireProtocol.BatchId(first.BatchId)||first.ConnectionId==Guid.Empty||
+                    first.Type!="start"||first.Mask is <1 or >7||rows.Length>512||
+                    rows.Where((e,i)=>e.Sequence!=i+1||e.ConnectionId!=first.ConnectionId||
+                        i>0&&(e.Type=="start"||rows[i-1].Type=="interrupted"||rows[i-1].Type=="status"&&rows[i-1].State is 2 or 3)).Any())
+                    throw new FormatException("Invalid interrupted batch journal.");
+                if(last.Type=="interrupted"||last.Type=="status"&&last.State is 2 or 3)continue;
+                if(last.Sequence>=512)throw new IOException("No terminal observation capacity.");
+                BatchEvent(new(station,Guid.NewGuid(),first.ConnectionId,first.BootId,first.BatchId,last.Sequence+1,
+                    "interrupted",at,Reason:"kiosk_restart_no_replay"));
+                recovered++;
+            }
+            return recovered;
+        }
+    }
     internal void Event(object value) => Put(Guid.NewGuid().ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal void Command(Guid id,object value)=>ReserveCommand(id,JsonSerializer.SerializeToUtf8Bytes(value));
     private void ReserveCommand(Guid id,byte[] bytes)

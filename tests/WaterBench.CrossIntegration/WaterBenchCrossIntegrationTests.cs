@@ -309,6 +309,35 @@ public sealed class WaterBenchCrossIntegrationTests
             Assert.Equal(3,await db.MediaAssets.CountAsync(x=>x.DeviceId==f.Camera&&!x.IsShared));
             Assert.Empty(await db.WaterBenchResultAssessments.ToListAsync());Assert.Empty(await db.WaterAnalysisRuns.Where(x=>x.FarmingAreaId==f.Area).ToListAsync());
             Assert.Equal(3,Directory.GetFiles(root,"*.jpg").Length);
+            // Command and cleaning may share the same request/run GUID, but not their stream identity.
+            var auditId=Guid.NewGuid();var auditConnection=Guid.NewGuid();var auditAt=DateTimeOffset.UtcNow;
+            var command=new BenchCommand(auditId,"cleanStart",Mask:1);
+            var attempt=new BenchCommandAttempt(1,auditId,f.Station,auditConnection,Boot,1,command,
+                WaterBenchSession.BuildCommand(command)!,auditAt);
+            var attemptHash=spool.BeginCommand(attempt);
+            spool.FinishCommand(new(1,auditId,auditConnection,Boot,1,attemptHash,"unknown","ack_timeout_no_replay",auditAt));
+            var cleaning=new BenchCleaningJournal(f.Station,auditConnection,Boot,auditId,1,spool);
+            cleaning.Begin(auditAt);cleaning.Interrupt("ack_timeout_no_replay",auditAt);
+            spool.StageAudits(f.Station);spool.StageAudits(f.Station);
+            Assert.Equal(4,q.Scan().Pending);
+            var auditEndpoint=new Uri(Origin,"/api/edge/water-bench/audit-events");
+            var firstAudit=q.Scan().Ready.First(x=>x.Kind=="audit");
+            var auditBody=q.Prepare(firstAudit);
+            using(var denied=await Post(direct,auditEndpoint,auditBody,OtherSecret))
+                Assert.Equal(HttpStatusCode.NotFound,denied.StatusCode);
+            using(var accepted=await Post(direct,auditEndpoint,auditBody))
+                Assert.False((await Data(accepted)).GetProperty("duplicate").GetBoolean());
+            using(var duplicate=await Post(direct,auditEndpoint,auditBody))
+                Assert.True((await Data(duplicate)).GetProperty("duplicate").GetBoolean());
+            for(int i=0;i<4;i++)
+                Assert.True((await BackendBenchBatchSync.SendNext(direct,BatchEndpoint,Secret,q,CancellationToken.None)).Acknowledged);
+            Assert.Equal(0,q.Scan().Pending);
+            var auditPath=$"/api/areas/{f.Area}/water-bench/batches/audit/{f.Station}";
+            using(var denied=await Get(direct,auditPath,f.Outsider))Assert.Equal(HttpStatusCode.Forbidden,denied.StatusCode);
+            using(var accepted=await Get(direct,auditPath,f.Admin))
+                Assert.Equal(4,(await Data(accepted)).GetProperty("total").GetInt32());
+            Assert.Equal(4,await db.WaterBenchEvidence.CountAsync(e=>e.StationId==f.Station&&
+                (e.Kind=="command"||e.Kind=="command_outcome"||e.Kind=="clean_status")));
             // Revoked kiosk cannot obtain even an existing receipt.
             var kiosk=await db.FarmKiosks.SingleAsync(x=>x.Id==f.Kiosk);kiosk.Status="Revoked";await db.SaveChangesAsync();
             using var revoked=await Post(direct,BatchEndpoint,start);Assert.Equal(HttpStatusCode.Forbidden,revoked.StatusCode);

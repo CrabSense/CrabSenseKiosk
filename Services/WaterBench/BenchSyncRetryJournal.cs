@@ -37,7 +37,7 @@ internal sealed class BenchSyncRetryJournal : IDisposable
                 if(saved.Version!=1||saved.StationId!=station||saved.BackendOrigin!=origin||
                     saved.Entries is null||saved.Entries.Length>MaxEntries||
                     saved.Entries.Any(x=>x is null||!WireProtocol.BatchId(x.BootId)||!WireProtocol.BatchId(x.BatchId)||
-                        x.EventId==Guid.Empty||x.Kind is not ("batch" or "media" or "nh3")||
+                        x.EventId==Guid.Empty||x.Kind is not ("batch" or "media" or "nh3" or "audit")||
                         x.LocalSha256 is null||!Regex.IsMatch(x.LocalSha256,@"\A[0-9a-f]{64}\z")||
                         x.Attempts is <1 or >20||x.NextAt==default||x.Reason is null||x.Reason.Length>80)||
                     saved.Entries.Select(x=>(x.BootId,x.BatchId)).Distinct().Count()!=saved.Entries.Length)

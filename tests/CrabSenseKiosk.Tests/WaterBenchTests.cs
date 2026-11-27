@@ -7,6 +7,27 @@ namespace CrabSenseKiosk.Tests;
 public sealed class WaterBenchTests
 {
     [Fact]
+    public void RestartTerminatesHistoricalBatchExactlyOnceAndNeverReplays()
+    {
+        var root=Path.Combine(Path.GetTempPath(),Guid.NewGuid().ToString("N"));
+        try
+        {
+            var station=Guid.NewGuid();var connection=Guid.NewGuid();var now=DateTimeOffset.UtcNow;
+            var spool=new EvidenceSpool(root,4*1024*1024,200);
+            var journal=new BatchObservationJournal(station,connection,"0123456789abcdef",spool);
+            journal.Start("BATCH START abcdef0123456789 mode=manual mask=1",Guid.NewGuid(),now);
+            var reopened=new EvidenceSpool(root,4*1024*1024,200);
+            Assert.Equal(1,reopened.RecoverInterruptedBatches(station,now.AddSeconds(1)));
+            Assert.Equal(0,reopened.RecoverInterruptedBatches(station,now.AddSeconds(2)));
+            var rows=Directory.GetFiles(root,"batch-timeline-*.json").Select(f=>
+                JsonSerializer.Deserialize<BenchBatchEvent>(File.ReadAllText(f),BenchMediaManifest.Json)!).OrderBy(e=>e.Sequence).ToArray();
+            Assert.Equal(2,rows.Length);Assert.Equal(connection,rows[1].ConnectionId);
+            Assert.Equal("interrupted",rows[1].Type);Assert.Equal("kiosk_restart_no_replay",rows[1].Reason);
+            Assert.Empty(Directory.GetFiles(root,"command-*.json"));
+        }
+        finally{if(Directory.Exists(root))Directory.Delete(root,true);}
+    }
+    [Fact]
     public void CommandsAreBoundedAndNotRaw()
     {
         var id=Guid.NewGuid();

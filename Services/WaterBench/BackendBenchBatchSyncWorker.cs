@@ -25,14 +25,14 @@ internal static class BackendBenchBatchSync
         var now=DateTimeOffset.UtcNow;
         // Preserve per-batch prerequisites from the queue; choose oldest eligible work
         // across batches, rather than starving JPEGs behind newer timeline events.
-        var enabled=plan.Ready.Where(x=>x.Kind=="batch"||x.Kind=="nh3"&&enableNh3||x.Kind=="media"&&enableMedia).ToArray();
+        var enabled=plan.Ready.Where(x=>x.Kind=="batch"||x.Kind=="audit"||x.Kind=="nh3"&&enableNh3||x.Kind=="media"&&enableMedia).ToArray();
         if(retry!=null)
         {
             retry.Reconcile(queue);
             var status=retry.Status(now);queue.RetryStatus(status.Deferred,status.NextRetryAt,status.GlobalUntil,retry.Entries());
             if(retry.GlobalPaused(now))return new("global_retry_wait");
         }
-        var next=retry==null?(enabled.FirstOrDefault(x=>x.Kind=="batch")??enabled.FirstOrDefault(x=>x.Kind=="nh3")??enabled.FirstOrDefault(x=>x.Kind=="media")):
+        var next=retry==null?(enabled.FirstOrDefault(x=>x.Kind=="batch")??enabled.FirstOrDefault(x=>x.Kind=="nh3")??enabled.FirstOrDefault(x=>x.Kind=="media")??enabled.FirstOrDefault(x=>x.Kind=="audit")):
             enabled.FirstOrDefault(x=>retry.Eligible(x,now));
         if(next is null&&enabled.Length>0)return new("batch_retry_wait");
         if(next is null)return new(plan.InvalidFiles>0||plan.BlockedBatches>0?"queue_blocked":
@@ -61,19 +61,20 @@ internal static class BackendBenchBatchSync
         BenchSyncQueue queue,BenchSyncCandidate next,CancellationToken ct)
     {
         var now=DateTimeOffset.UtcNow;
-        bool media=next.Kind=="media",nh3=next.Kind=="nh3";
+        bool media=next.Kind=="media",nh3=next.Kind=="nh3",audit=next.Kind=="audit";
         queue.TransportStatus(media?"sending_media":nh3?"sending_nh3":"sending",attempt:now);
         try
         {
             var body=queue.Prepare(next);
-            if(!media&&!nh3&&(body is not BenchBatchEvent batch||batch.EventId!=next.EventId||batch.StationId!=next.StationId)||
-                nh3&&(body is not Nh3EvidenceEvent n||n.EventId!=next.EventId||n.StationId!=next.StationId))
+            if(!media&&!nh3&&!audit&&(body is not BenchBatchEvent batch||batch.EventId!=next.EventId||batch.StationId!=next.StationId)||
+                nh3&&(body is not Nh3EvidenceEvent n||n.EventId!=next.EventId||n.StationId!=next.StationId)||
+                audit&&(body is not BenchAuditEvent a||a.EventId!=next.EventId||a.StationId!=next.StationId))
                 return new("local_evidence_invalid");
             var bytesToSend=JsonSerializer.SerializeToUtf8Bytes(body,body.GetType(),BenchMediaManifest.Json);
-            if(bytesToSend.Length>(media?96*1024:8192))return new("local_evidence_invalid");
+            if(bytesToSend.Length>(media?96*1024:audit?32768:8192))return new("local_evidence_invalid");
             // Fixed same-origin paths; never follow a response-supplied URL.
             var target=media?new Uri(endpoint,"/api/edge/water-bench/media"):
-                nh3?new Uri(endpoint,"/api/edge/water-bench/nh3-evidence"):endpoint;
+                nh3?new Uri(endpoint,"/api/edge/water-bench/nh3-evidence"):audit?new Uri(endpoint,"/api/edge/water-bench/audit-events"):endpoint;
             using var request=new HttpRequestMessage(HttpMethod.Post,target);
             request.Headers.Add("X-Kiosk-Key",secret.Trim());
             request.Content=new ByteArrayContent(bytesToSend);
@@ -164,6 +165,7 @@ public sealed class BackendBenchBatchSyncWorker(IHttpClientFactory clients,IOpti
                     queue.TransportStatus("not_provisioned");
                 else
                 {
+                    session.StageAudits();
                     using var client=clients.CreateClient("water-bench-batch-sync");
                     var result=await BackendBenchBatchSync.SendNext(client,endpoint,secret,queue,ct,settings.EnableMediaSync,settings.EnableNh3EvidenceSync,retry);
                     if(!result.Acknowledged)queue.TransportStatus(result.State,httpStatus:result.HttpStatus);

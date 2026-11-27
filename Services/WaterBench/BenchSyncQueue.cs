@@ -40,7 +40,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         {
             try
             {
-                string prefix=kind switch{"batch"=>"batch-timeline-","media"=>"media-manifest-","nh3"=>"nh3-evidence-",_=>throw new IOException("Unknown sync kind.")};
+                string prefix=kind switch{"batch"=>"batch-timeline-","media"=>"media-manifest-","nh3"=>"nh3-evidence-","audit"=>"audit-event-",_=>throw new IOException("Unknown sync kind.")};
                 var e=Load(prefix+id.ToString("N")+".json");
                 return e.Ack&&e.Candidate.StationId==station&&e.Candidate.LocalSha256==localSha256;
             }
@@ -82,7 +82,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         ??throw new IOException("Invalid spool JSON.");
     private static bool Identity(Guid id,Guid station,Guid connection,string boot,string batch,DateTimeOffset at)=>
         id!=Guid.Empty&&station!=Guid.Empty&&connection!=Guid.Empty&&WireProtocol.BatchId(boot)&&WireProtocol.BatchId(batch)&&at!=default;
-    private sealed record Entry(BenchSyncCandidate Candidate,BenchBatchEvent? Batch,BenchMediaManifest? Media,bool Ack,Nh3EvidenceEvent? Nh3=null,BenchSyncReceipt? Receipt=null);
+    private sealed record Entry(BenchSyncCandidate Candidate,BenchBatchEvent? Batch,BenchMediaManifest? Media,bool Ack,Nh3EvidenceEvent? Nh3=null,BenchSyncReceipt? Receipt=null,BenchAuditEvent? Audit=null);
     private static bool ValidAck(BenchSyncCandidate c,BenchSyncReceipt r)=>
         r.EventId==c.EventId&&r.Kind==c.Kind&&r.LocalSha256==c.LocalSha256&&r.ReceiptId!=Guid.Empty&&r.RecordedAt!=default&&
         (c.Kind=="media"?(r.MediaId.HasValue&&r.MediaId!=Guid.Empty&&r.Sha256==c.ImageSha256):
@@ -92,9 +92,10 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         bool isBatch=TryFileId(name,"batch-timeline-",out var id);
         bool isNh3=!isBatch&&TryFileId(name,"nh3-evidence-",out id);
         if(isBatch)_=TryFileId(name,"batch-timeline-",out id);
-        if(!isBatch&&!isNh3&&!TryFileId(name,"media-manifest-",out id))throw new IOException("Invalid spool filename.");
-        var bytes=ReadBounded(PathFor(name),MaxMetadata);
-        BenchBatchEvent? batch=null;BenchMediaManifest? media=null;Nh3EvidenceEvent? nh3=null;BenchSyncCandidate c;
+        bool isAudit=!isBatch&&!isNh3&&TryFileId(name,"audit-event-",out id);
+        if(!isBatch&&!isNh3&&!isAudit&&!TryFileId(name,"media-manifest-",out id))throw new IOException("Invalid spool filename.");
+        var bytes=ReadBounded(PathFor(name),isAudit?32768:MaxMetadata);
+        BenchBatchEvent? batch=null;BenchMediaManifest? media=null;Nh3EvidenceEvent? nh3=null;BenchAuditEvent? audit=null;BenchSyncCandidate c;
         if(isBatch)
         {
             batch=Parse<BenchBatchEvent>(bytes);
@@ -108,6 +109,12 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
             nh3=Parse<Nh3EvidenceEvent>(bytes);Nh3EvidencePolicy.Validate(nh3);
             if(nh3.EventId!=id)throw new IOException("Invalid NH3 event identity.");
             c=new(id,"nh3",Hash(bytes),nh3.StationId,nh3.BootId,nh3.BatchId,nh3.ConnectionId,nh3.ReceivedAt,null);
+        }
+        else if(isAudit)
+        {
+            audit=Parse<BenchAuditEvent>(bytes);audit.Validate();
+            if(audit.EventId!=id)throw new IOException("Audit event identity.");
+            c=new(id,"audit",Hash(bytes),audit.StationId,audit.BootId,audit.StreamId,audit.ConnectionId,audit.At,audit.Order);
         }
         else
         {
@@ -131,7 +138,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         var receiptPath=PathFor(ReceiptName(id));bool ack=File.Exists(receiptPath);
         var receipt=ack?Parse<BenchSyncReceipt>(ReadBounded(receiptPath,EvidenceSpool.ReceiptBudget)):null;
         if(receipt!=null&&!ValidAck(c,receipt))throw new IOException("Receipt does not match immutable evidence.");
-        return new(c,batch,media,ack,nh3,receipt);
+        return new(c,batch,media,ack,nh3,receipt,audit);
     }
     internal BenchSyncPlan Scan()
     {
@@ -154,7 +161,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
                     continue;
                 }
                 if(!name.StartsWith("batch-timeline-",StringComparison.Ordinal)&&!name.StartsWith("media-manifest-",StringComparison.Ordinal)&&
-                    !name.StartsWith("nh3-evidence-",StringComparison.Ordinal))continue;
+                    !name.StartsWith("nh3-evidence-",StringComparison.Ordinal)&&!name.StartsWith("audit-event-",StringComparison.Ordinal))continue;
                 try{entries.Add(Load(name));}
                 catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or JsonException or FormatException or ArgumentException){invalid++;}
             }
@@ -177,6 +184,19 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         var ready=new List<BenchSyncCandidate>();var ackable=new List<BenchSyncCandidate>();int blocked=0;
         foreach(var group in current.GroupBy(x=>(x.Candidate.BootId,x.Candidate.BatchId)))
         {
+            if(group.Any(x=>x.Audit!=null))
+            {
+                var audits=group.OrderBy(x=>x.Audit?.Order).ToArray();
+                var firstAudit=audits[0].Audit;
+                if(firstAudit==null||audits.Any(x=>x.Audit==null||x.Audit.JournalId!=firstAudit.JournalId||
+                    x.Audit.ConnectionId!=firstAudit.ConnectionId)||audits.SkipWhile(x=>x.Ack).Any(x=>x.Ack)||
+                    (firstAudit.Kind=="clean_status"?audits.Where((x,i)=>x.Audit!.Kind!="clean_status"||x.Audit.Sequence!=i+1).Any():
+                    firstAudit.Kind!="command"||audits.Length>2||audits.Length==2&&audits[1].Audit!.Kind!="command_outcome"))
+                {blocked++;blockedKeys.Add(group.Key);continue;}
+                var auditNext=audits.FirstOrDefault(x=>!x.Ack);
+                if(auditNext!=null){ready.Add(auditNext.Candidate);ackable.Add(auditNext.Candidate);}
+                continue;
+            }
             var rows=group.Where(x=>x.Batch!=null).OrderBy(x=>x.Batch!.Sequence).ToArray();
             var media=group.Where(x=>x.Media!=null).OrderBy(x=>x.Candidate.ReceivedAt).ThenBy(x=>x.Candidate.EventId).ToArray();
             var nh3=group.Where(x=>x.Nh3!=null).OrderBy(x=>x.Nh3!.Type=="sample"?0:1).ThenBy(x=>x.Candidate.ReceivedAt).ToArray();
@@ -235,10 +255,11 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
     }
     private object PrepareLocked(BenchSyncCandidate c)
     {
-        string prefix=c.Kind switch{"batch"=>"batch-timeline-","media"=>"media-manifest-","nh3"=>"nh3-evidence-",_=>throw new IOException("Unknown sync kind.")};
+        string prefix=c.Kind switch{"batch"=>"batch-timeline-","media"=>"media-manifest-","nh3"=>"nh3-evidence-","audit"=>"audit-event-",_=>throw new IOException("Unknown sync kind.")};
         string name=prefix+c.EventId.ToString("N")+".json";
         var e=Load(name);
         if(e.Candidate!=c)throw new IOException("Evidence changed.");
+        if(e.Audit!=null)return e.Audit;
         if(e.Batch!=null)return e.Batch;
         if(e.Nh3!=null)return e.Nh3;
         return e.Media!.UploadBody(ReadBounded(PathFor(e.Media.LocalFile),WireProtocol.MaxFrame));
@@ -288,7 +309,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
             retry?.NextAt>now?"batch_retry_wait":"pending";
         return new{g.Key.BootId,g.Key.BatchId,state,total=rows.Length,pending,acknowledged=rows.Length-pending,
             timeline=Counts(rows.Where(x=>x.Candidate.Kind=="batch")),media=Counts(rows.Where(x=>x.Candidate.Kind=="media")),
-            nh3=Counts(rows.Where(x=>x.Candidate.Kind=="nh3")),
+            nh3=Counts(rows.Where(x=>x.Candidate.Kind=="nh3")),audit=Counts(rows.Where(x=>x.Candidate.Kind=="audit")),
             lastObservedAt=rows.Max(x=>x.Candidate.ReceivedAt),
             lastLocalReceiptAt=rows.Where(x=>x.Receipt!=null).Select(x=>(DateTimeOffset?)x.Receipt!.RecordedAt).Max(),
             timelineTerminal=last?.Type=="interrupted"||last?.Type=="status"&&last.State is 2 or 3,
@@ -301,7 +322,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         {
             Entry[] rows=[];HashSet<(string BootId,string BatchId)> blocked=[];
             var p=ScanLocked((e,b)=>{rows=e;blocked=b;});
-            var groups=rows.GroupBy(x=>(x.Candidate.BootId,x.Candidate.BatchId))
+            var groups=rows.Where(x=>x.Audit==null).GroupBy(x=>(x.Candidate.BootId,x.Candidate.BatchId))
                 .OrderByDescending(g=>g.Max(x=>x.Candidate.ReceivedAt)).ThenBy(g=>g.Key.BootId).ThenBy(g=>g.Key.BatchId).ToArray();
             return new{stationId=station,p.State,inventoryComplete=p.InvalidFiles==0&&p.State!="station_not_configured",
                 total=groups.Length,skip,take,items=groups.Skip(skip).Take(take).Select(g=>BatchSummary(g,p,blocked,DateTimeOffset.UtcNow)).ToArray(),
@@ -314,7 +335,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
         {
             Entry[] rows=[];HashSet<(string BootId,string BatchId)> blocked=[];
             var p=ScanLocked((e,b)=>{rows=e;blocked=b;});
-            var g=rows.Where(x=>x.Candidate.BootId==boot&&x.Candidate.BatchId==batch)
+            var g=rows.Where(x=>x.Audit==null&&x.Candidate.BootId==boot&&x.Candidate.BatchId==batch)
                 .GroupBy(x=>(x.Candidate.BootId,x.Candidate.BatchId)).SingleOrDefault();
             if(g is null)return p.InvalidFiles>0?new{state=p.State,inventoryComplete=false}:null;
             var items=g.OrderBy(x=>x.Batch?.Sequence??int.MaxValue).ThenBy(x=>x.Candidate.ReceivedAt).ThenBy(x=>x.Candidate.EventId).Take(518)
@@ -336,7 +357,7 @@ internal sealed class BenchSyncQueue(EvidenceSpool spool,Guid station)
             var p=ScanLocked((e,b)=>rows=e);
             return new{p.State,p.Pending,p.Acknowledged,p.Foreign,p.BlockedBatches,p.InvalidFiles,readyBatches=p.Ready.Select(x=>(x.BootId,x.BatchId)).Distinct().Count(),
                 timeline=Counts(rows.Where(x=>x.Candidate.Kind=="batch")),media=Counts(rows.Where(x=>x.Candidate.Kind=="media")),
-                nh3=Counts(rows.Where(x=>x.Candidate.Kind=="nh3")),
+                nh3=Counts(rows.Where(x=>x.Candidate.Kind=="nh3")),audit=Counts(rows.Where(x=>x.Candidate.Kind=="audit")),
                 durableLastReceiptAt=rows.Where(x=>x.Receipt!=null).Select(x=>(DateTimeOffset?)x.Receipt!.RecordedAt).Max(),
                 inventoryComplete=p.InvalidFiles==0&&p.State!="station_not_configured",storage=spool.CapacitySnapshot(),
                 stationId=station,automaticUploadImplemented=true,batchSyncEnabled,mediaSyncEnabled=batchSyncEnabled&&mediaSyncEnabled,nh3SyncEnabled=batchSyncEnabled&&nh3SyncEnabled,
