@@ -1,2 +1,4 @@
 # P2.3.6 — split integration gates
 Kiosk is public; Water AI is private. Never checkout private AI source in the public Kiosk workflow or introduce a cross-repository PAT. Public CI continues mandatory Kiosk + pinned BE + PostgreSQL regression, now on BE a9d62d00840faa3c2c0ef4a999c7e120b884e2fe. Full signed optical inference/retry/role/NH3 tests run in the private CrabSenseAIWaterQualityAnalysis workflow with pinned public Kiosk and BE sources, synthetic data and CI-only credentials. Both gates must pass before P2.3.6 acceptance; public green alone is insufficient. Real Drive, hardware, JWT/client platform and chemical accuracy remain outside CI.
+
+P2.4.6.1: advance reviewed public BE pin to 14ccffdb9633b46a99e39187dba82db8990b4b55 (review/publication, durable retry, platform diagnostics). Public integration remains PostgreSQL and synthetic evidence. No production credentials; CI must pass before merge.
