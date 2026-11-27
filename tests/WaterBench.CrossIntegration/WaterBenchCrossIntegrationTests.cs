@@ -268,7 +268,8 @@ public sealed class WaterBenchCrossIntegrationTests
             drop.DropNextSuccess=true;
             var lost=await BackendBenchBatchSync.SendNext(client,BatchEndpoint,Secret,q,default,true,true);
             Assert.Equal("transport_unavailable",lost.State);Assert.Equal(1,storage.Count);Assert.Equal(3,q.Scan().Pending);
-            q=new BenchSyncQueue(new EvidenceSpool(root,4*1024*1024,200),f.Station);
+            spool=new EvidenceSpool(root,4*1024*1024,200);
+            q=new BenchSyncQueue(spool,f.Station);
             Assert.Equal(media.EventId,Assert.Single(q.Scan().Ready).EventId);
             Assert.True((await BackendBenchBatchSync.SendNext(client,BatchEndpoint,Secret,q,default,true,true)).Acknowledged);
             Assert.Equal(2,storage.Uploads); // corrupt attempt + committed image; retry did not re-upload
@@ -329,8 +330,13 @@ public sealed class WaterBenchCrossIntegrationTests
                 Assert.False((await Data(accepted)).GetProperty("duplicate").GetBoolean());
             using(var duplicate=await Post(direct,auditEndpoint,auditBody))
                 Assert.True((await Data(duplicate)).GetProperty("duplicate").GetBoolean());
+            // Reopen the shared spool and queue together, preserving all outstanding receipt reservations.
+            spool=new EvidenceSpool(root,4*1024*1024,200);q=new BenchSyncQueue(spool,f.Station);
             for(int i=0;i<4;i++)
-                Assert.True((await BackendBenchBatchSync.SendNext(direct,BatchEndpoint,Secret,q,CancellationToken.None)).Acknowledged);
+            {
+                var result=await BackendBenchBatchSync.SendNext(direct,BatchEndpoint,Secret,q,CancellationToken.None);
+                Assert.True(result.Acknowledged,$"Audit sync {i}: {result.State} HTTP {result.HttpStatus}");
+            }
             Assert.Equal(0,q.Scan().Pending);
             var auditPath=$"/api/areas/{f.Area}/water-bench/batches/audit/{f.Station}";
             using(var denied=await Get(direct,auditPath,f.Outsider))Assert.Equal(HttpStatusCode.Forbidden,denied.StatusCode);
@@ -338,6 +344,31 @@ public sealed class WaterBenchCrossIntegrationTests
                 Assert.Equal(4,(await Data(accepted)).GetProperty("total").GetInt32());
             Assert.Equal(4,await db.WaterBenchEvidence.CountAsync(e=>e.StationId==f.Station&&
                 (e.Kind=="command"||e.Kind=="command_outcome"||e.Kind=="clean_status")));
+            // Abrupt process exit with an unfinished batch: close only the historical observation,
+            // retaining its original boot and connection. No device dispatch is involved.
+            const string interruptedBatch="abcdef0123456790";
+            var interruptedConnection=Guid.NewGuid();
+            var interruptedJournal=new BatchObservationJournal(f.Station,interruptedConnection,Boot,spool);
+            interruptedJournal.Start("BATCH START "+interruptedBatch+" mode=manual mask=1",Guid.NewGuid(),auditAt);
+            spool=new EvidenceSpool(root,4*1024*1024,200);
+            Assert.Equal(1,spool.RecoverInterruptedBatches(f.Station,DateTimeOffset.UtcNow));
+            Assert.Equal(0,spool.RecoverInterruptedBatches(f.Station,DateTimeOffset.UtcNow));
+            q=new BenchSyncQueue(spool,f.Station);
+            Assert.Equal(2,q.Scan().Pending);
+            for(int i=0;i<2;i++)
+            {
+                var result=await BackendBenchBatchSync.SendNext(direct,BatchEndpoint,Secret,q,CancellationToken.None);
+                Assert.True(result.Acknowledged,$"Restart sync {i}: {result.State} HTTP {result.HttpStatus}");
+            }
+            Assert.Equal(0,q.Scan().Pending);
+            var interruptedPath=$"/api/areas/{f.Area}/water-bench/batches/{f.Station}/{Boot}/{interruptedBatch}";
+            using(var recovered=await Get(direct,interruptedPath,f.Admin))
+            {
+                var timeline=(await Data(recovered)).GetProperty("timeline");
+                Assert.Equal("interrupted_observed",timeline.GetProperty("status").GetString());
+                Assert.Equal(interruptedConnection,timeline.GetProperty("connectionId").GetGuid());
+                Assert.False(timeline.GetProperty("physicalCompletionVerified").GetBoolean());
+            }
             // Revoked kiosk cannot obtain even an existing receipt.
             var kiosk=await db.FarmKiosks.SingleAsync(x=>x.Id==f.Kiosk);kiosk.Status="Revoked";await db.SaveChangesAsync();
             using var revoked=await Post(direct,BatchEndpoint,start);Assert.Equal(HttpStatusCode.Forbidden,revoked.StatusCode);
