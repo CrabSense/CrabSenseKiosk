@@ -24,6 +24,7 @@ public sealed class WaterBenchSession
     private DateTimeOffset? _telemetryAt;
     private string? _activeBatch;
     private BatchObservationJournal? _timeline;
+    private BenchCleaningJournal? _cleanJournal;
     private Nh3EvidenceEvent? _nh3SampleEvent,_nh3ImageEvent;
     private bool _fault;
     private Guid _connection;
@@ -57,7 +58,8 @@ public sealed class WaterBenchSession
     {
         lock(_gate)
         {
-            InterruptTimeline("connection_replaced");EndUnknown("connection_replaced");
+            InterruptCleaning("connection_replaced");InterruptTimeline("connection_replaced");EndUnknown("connection_replaced");
+            _cleanJournal=null;
             _connection=Guid.NewGuid(); _write=write; _timeline=null;_nh3SampleEvent=_nh3ImageEvent=null;
             _master=_slave=_batch=_clean=_sample=null; _telemetry=null; _telemetryAt=null;
             _activeBatch=null; _startPending=false; _boot=null; _clock=null; _helloNonce=Guid.Empty; _pending=null; _lastSequence=0; _batchAtMs=_cleanAtMs=_telemetryAtMs=0; _sessions.Clear(); _links.Clear(); _frames.Clear(); _saved.Clear(); _camera.Reset();
@@ -73,7 +75,7 @@ public sealed class WaterBenchSession
         lock(_gate)
         {
             if (_activeBatch is not null || _write is not null) { _fault=true; _error="connection_lost_inspect_before_restart"; }
-            InterruptTimeline("disconnect");
+            InterruptCleaning("disconnect");InterruptTimeline("disconnect");
             EndUnknown("disconnect");
             _write=null; _master=_slave=null; _boot=null; _clock=null;
             _batchAtMs=_cleanAtMs=_telemetryAtMs=0;_helloNonce=Guid.Empty;_camera.Reset(); _links.Clear(); _frames.Clear(); _saved.Clear();
@@ -101,8 +103,16 @@ public sealed class WaterBenchSession
         try{_timeline?.Interrupt(reason,DateTimeOffset.UtcNow);}
         catch(Exception ex) when(ex is IOException or UnauthorizedAccessException){_fault=true;_error="batch_timeline_storage_failed";}
     }
+    private void InterruptCleaning(string reason)
+    {
+        try{_cleanJournal?.Interrupt(reason,DateTimeOffset.UtcNow);}
+        catch(Exception ex) when(ex is IOException or UnauthorizedAccessException or FormatException)
+        {_fault=true;_error="clean_journal_storage_or_transition_failed";}
+    }
     private void Fault(string error)
     {
+        // CLEAN FAULT is immediately followed by structured CLEAN STATUS.
+        if(error!="firmware_clean_fault")InterruptCleaning(error);
         // Firmware fault line is followed by a structured terminal status.
         if(error!="firmware_reported_fault"&&error!="firmware_batch_fault")InterruptTimeline(error);
         EndUnknown(error);_fault=true;_error=error;
@@ -132,12 +142,17 @@ public sealed class WaterBenchSession
     }
     public object? CommandStatus(Guid id){lock(_gate)return _spool.CommandStatus(id,_pending?.Id);}
     public object Commands(int skip,int take){lock(_gate)return _spool.Commands(skip,take,_pending?.Id);}
+    public object CleaningRuns(int skip,int take,Guid? run=null)
+    {
+        lock(_gate)return _spool.CleaningRuns(_write!=null&&_cleanJournal?.Unsettled==true?_cleanJournal.RunId:null,skip,take,run);
+    }
     private string RecoveryReadinessLocked()
     {
         if(!_options.Enabled||!_options.EnableSupervisedControl)return "supervised_control_disabled";
         if(!_fault)return "inspection_not_required";
         if(!Identified||_pending!=null||_helloNonce!=Guid.Empty)return "identified_idle_connection_required";
         if(_activeBatch!=null||_timeline?.Active==true)return "held_batch_requires_local_reset";
+        if(_cleanJournal?.Unsettled==true)return "cleaning_inspection_or_reset_required";
         if(!_spool.HasCapacity)return "spool_full";
         long now=NowMs;
         if(_batch is null||_clean is null||_telemetry is null||_batchAtMs==0||_cleanAtMs==0||_telemetryAtMs==0||
@@ -178,6 +193,7 @@ public sealed class WaterBenchSession
             }
             catch(Exception ex) when(ex is IOException or UnauthorizedAccessException)
             {message="Recovery audit could not be committed; gate remains locked.";return false;}
+            _cleanJournal=null; // immutable historical runs remain on disk
             _fault=false;_error=null;_boot=null;_clock=null;_lastSequence=0;_helloNonce=Guid.Empty;
             _startPending=false;_batchAtMs=_cleanAtMs=_telemetryAtMs=0;
             message="Inspection recorded. Fresh gateway handshake and status required; no command replay.";
@@ -244,7 +260,9 @@ public sealed class WaterBenchSession
             {Fault("batch_start_ack_mismatch");return;}
             _spool.FinishCommand(new(1,p.Id,_connection,p.Boot,p.Seq,p.AttemptSha256,
                 ack.Accepted?"accepted":"rejected",ack.Reason,utc,ack,_clock?.Estimate(ack.UptimeMs,now)));
+            bool cleanAck=_cleanJournal?.Ack(ack,utc)==true;
             _pending=null;_lastSequence=ack.Sequence;
+            if(cleanAck&&_cleanJournal?.State=="interrupted_observed"){Fault("clean_ack_contradiction");return;}
             if(start){_startPending=false;_batchAtMs=_cleanAtMs=0;}
             return;
         }
@@ -313,7 +331,20 @@ public sealed class WaterBenchSession
         }
         if(line.StartsWith("CLEAN STATUS ",StringComparison.Ordinal))
         {
-            _clean=WireProtocol.Json(line[13..]);_cleanAtMs=now;Store("clean_status",_clean.Value);return;
+            var e=WireProtocol.Json(line[13..]);var status=BenchCleanStatus.Parse(e);
+            Store("clean_status",e);
+            if(_cleanJournal?.Active==true)_cleanJournal.Observe(status,utc);
+            else if(status.Step is not ("idle" or "complete" or "fault")&&!_fault)
+            {Fault("unassociated_cleaning_observation");return;}
+            _clean=e;_cleanAtMs=now;
+            if(status.Step=="fault")
+            {
+                if(!_fault)Fault("firmware_clean_fault");
+                // Fault may arrive before the command's ACK. The command journal
+                // is already uncertain; retain structured fault and end the run.
+                InterruptCleaning("firmware_clean_fault_ack_unknown");
+            }
+            return;
         }
         if(line.StartsWith("NH3 SAMPLE ",StringComparison.Ordinal))
         {
@@ -378,8 +409,8 @@ public sealed class WaterBenchSession
             _activeBatch=null;_sample=null;_nh3SampleEvent=_nh3ImageEvent=null;_sessions.Clear();_links.Clear();_frames.Clear();_saved.Clear();_camera.Reset();Store("operator_event",line);return;
         }
         // Only a matching structured ACK may resolve a command. Human-readable REJECT is evidence only.
-        if(line.StartsWith("BATCH FAULT",StringComparison.Ordinal)||line.StartsWith("CLEAN FAULT",StringComparison.Ordinal))
-            Fault("firmware_reported_fault");
+        if(line.StartsWith("BATCH FAULT",StringComparison.Ordinal))Fault("firmware_reported_fault");
+        if(line.StartsWith("CLEAN FAULT",StringComparison.Ordinal))Fault("firmware_clean_fault");
         if(line.StartsWith("BATCH ",StringComparison.Ordinal)||line.StartsWith("CLEAN ",StringComparison.Ordinal)||line.StartsWith("REJECT",StringComparison.Ordinal))
             Store("operator_event",line);
     }
@@ -404,6 +435,7 @@ public sealed class WaterBenchSession
             identified=Identified,recoveryRequired=_fault,error=_error,recoveryReadiness=RecoveryReadinessLocked(),
             startupInspectionRequired=true,spoolCapacity=_spool.HasCapacity,
             master=_master,slave=_slave,batch=_batch,clean=_clean,nh3Sample=_sample,
+            cleaningRunId=_cleanJournal?.RunId,cleaningJournalState=_cleanJournal?.State,physicalCleaningVerified=false,
             telemetry=_telemetry is null?null:new Dictionary<string,string>(_telemetry),telemetryReceivedAt=_telemetryAt,
             activeBatch=_activeBatch,startPending=_startPending,gatewayBootId=_boot,gatewayReady=_boot is not null&&!_fault,pendingCommandId=_pending?.Id,clockObservation=_clock,scheduleReadiness=ReadinessLocked(),savedCaptureIds=_saved.Keys.ToArray(),clockBasis="kiosk_receipt_not_exposure",
             physicalAlignmentVerified=false,backendUploadImplemented=true
@@ -480,6 +512,14 @@ public sealed class WaterBenchSession
             if(starting&&ReadinessLocked()!="ready"){message=ReadinessLocked();return false;}
             string? command=BuildCommand(request);
             if(command is null)return false;
+            if(request.Action=="cleanStart")
+            {
+                if(_cleanJournal?.Unsettled==true||_clean is null||_cleanAtMs==0||NowMs-_cleanAtMs>15000||
+                    BenchCleanStatus.Parse(_clean.Value) is not {Step:"idle",StorageOk:true})
+                {message="Fresh idle cleaning status required.";return false;}
+            }
+            if((request.Action is "cleanRoute" or "cleanVerify")&&_cleanJournal?.Active!=true)
+            {message="No associated supervised cleaning run.";return false;}
             if(request.Action=="image" && (!_saved.TryGetValue(request.CaptureId,out var saved)||_activeBatch is null||saved.Analyte!=(request.Id==1?"NO2":request.Id==2?"NO3":"NH3")))return false;
             try
             {
@@ -491,6 +531,12 @@ public sealed class WaterBenchSession
                     request,command,DateTimeOffset.UtcNow);
                 string digest=_spool.BeginCommand(attempt);
                 _pending=new(request.RequestId,seq,request.Action,NowMs,_boot,digest);
+                if(request.Action=="cleanStart")
+                {
+                    _cleanJournal=new(_options.BackendStationId,_connection,_boot,request.RequestId,request.Mask,_spool);
+                    _cleanJournal.Begin(DateTimeOffset.UtcNow);
+                }
+                else if(request.Action is "cleanRoute" or "cleanVerify")_cleanJournal!.Command(request,DateTimeOffset.UtcNow);
                 if(starting){_startPending=true;_batchAtMs=_cleanAtMs=0;}
                 _write(frame);message="Sent to UART; query command status for ACK";return true;
             }

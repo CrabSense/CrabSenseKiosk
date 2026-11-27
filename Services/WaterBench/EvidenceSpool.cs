@@ -116,6 +116,16 @@ internal sealed class EvidenceSpool
             WriteOutcome(outcome.RequestId,JsonSerializer.SerializeToUtf8Bytes(outcome,BenchMediaManifest.Json));
         }
     }
+    internal void CleanEvent(BenchCleanEvent e)
+    {
+        var bytes=JsonSerializer.SerializeToUtf8Bytes(e,BenchMediaManifest.Json);
+        if(bytes.Length>4096)throw new IOException("Cleaning evidence size.");
+        Put(BenchCleaningInventory.Name(e.RunId,e.Sequence),bytes);
+    }
+    internal object CleaningRuns(Guid? live,int skip,int take,Guid? run)
+    {
+        lock(_gate)return BenchCleaningInventory.Query(_root,live,skip,take,run);
+    }
     internal void Recovery(Guid id,object value)=>Put("recovery-"+id.ToString("N")+".json",JsonSerializer.SerializeToUtf8Bytes(value));
     internal bool HasCommand(Guid id)=>File.Exists(Path.Combine(_root,"command-"+id.ToString("N")+".json"));
     internal void Outcome(Guid id,object value)=>WriteOutcome(id,JsonSerializer.SerializeToUtf8Bytes(value));
