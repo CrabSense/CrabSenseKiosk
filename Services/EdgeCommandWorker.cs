@@ -119,6 +119,7 @@ public sealed class EdgeCommandWorker : BackgroundService
                     .ReadFromJsonAsync<ApiEnvelope<List<EdgeCommand>>>(cancellationToken: ct);
                 foreach (var command in envelope?.Data ?? [])
                     await ForwardAsync(snapshot, command, backend, ct);
+                await NoteRailJobAsync(snapshot, backend, ct);
             }
             catch (Exception ex)
             {
@@ -308,6 +309,80 @@ public sealed class EdgeCommandWorker : BackgroundService
             command.Id,
             snapshot.DeviceCode,
             delivered ? "acknowledged" : "failed");
+    }
+
+    private async Task NoteRailJobAsync(DTOs.TelemetrySnapshot snapshot, string backend, CancellationToken ct)
+    {
+        try
+        {
+            var client = _httpClients.CreateClient();
+            using var request = new HttpRequestMessage(
+                HttpMethod.Get,
+                $"{backend}/api/rails/jobs?deviceCode={Uri.EscapeDataString(snapshot.DeviceCode)}");
+            request.Headers.Add("X-Edge-Key", _options.ApiKey);
+            using var response = await client.SendAsync(request, ct);
+            if (!response.IsSuccessStatusCode)
+                return;
+            var job = await response.Content.ReadFromJsonAsync<ApiEnvelope<RailJobNote>>(cancellationToken: ct);
+            if (job?.Data is null || job.Data.Phase is "unknown" or "stopped")
+                return;
+            if (job.Data.Kind == "manual" || job.Data.X is null || job.Data.Z is null)
+            {
+                _logger.LogInformation(
+                    "Rail job {Kind} for {DeviceCode} stays off the relay queue.",
+                    job.Data.Kind,
+                    snapshot.DeviceCode);
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(snapshot.IpAddress))
+                return;
+            var baseUrl = snapshot.IpAddress.TrimEnd('/');
+            if (!baseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                && !baseUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                baseUrl = $"http://{baseUrl}";
+            var posted = false;
+            try
+            {
+                using var board = await client.PostAsJsonAsync(
+                    $"{baseUrl}/api/command",
+                    new { command = "cap", channel = "1", x = job.Data.X, z = job.Data.Z },
+                    ct);
+                var text = await board.Content.ReadAsStringAsync(ct);
+                posted = board.IsSuccessStatusCode && text.Contains("\"success\":true", StringComparison.Ordinal);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                posted = false;
+            }
+            if (posted)
+                return;
+            using var report = new HttpRequestMessage(
+                HttpMethod.Post,
+                $"{backend}/api/rails/jobs/report")
+            {
+                Content = JsonContent.Create(new
+                {
+                    deviceCode = snapshot.DeviceCode,
+                    @event = "fail",
+                    boxId = job.Data.BoxId
+                })
+            };
+            report.Headers.Add("X-Edge-Key", _options.ApiKey);
+            await client.SendAsync(report, ct);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            _logger.LogWarning("Rail job poll skipped for {DeviceCode}: {Message}", snapshot.DeviceCode, ex.Message);
+        }
+    }
+
+    private sealed class RailJobNote
+    {
+        public string Kind { get; set; } = string.Empty;
+        public Guid? BoxId { get; set; }
+        public decimal? X { get; set; }
+        public decimal? Z { get; set; }
+        public string? Phase { get; set; }
     }
 
     private sealed class ApiEnvelope<T>
