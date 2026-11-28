@@ -39,4 +39,48 @@ public sealed class GatewayAckTests
             Assert.Throws<IOException>(()=>spool.Outcome(id,new {state="rejected"}));
         }finally{Directory.Delete(root,true);}
     }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void RejectsLegacyOrUnknownGatewayVersion(int version)
+    {
+        var id=Guid.NewGuid();
+        const string boot="0123456789abcdef";
+        var hello=System.Text.Json.JsonSerializer.Serialize(new {version,nonce=id.ToString("N"),boot_id=boot,last_seq=0,uptime_ms=10});
+        var ack=System.Text.Json.JsonSerializer.Serialize(new {version,boot_id=boot,request_id=id.ToString("N"),seq=1,accepted=true,reason="accepted",uptime_ms=11,batch_id=boot});
+        Assert.Throws<FormatException>(()=>GatewayWire.Hello(WireProtocol.Json(hello),id));
+        Assert.Throws<FormatException>(()=>GatewayWire.Ack(WireProtocol.Json(ack)));
+    }
+
+    [Theory]
+    [InlineData("boot_mismatch")]
+    [InlineData("sequence_mismatch")]
+    [InlineData("unsupported")]
+    [InlineData("rejected")]
+    public void FirmwareRejectionIsNeverAnAcceptedCommand(string reason)
+    {
+        var id=Guid.NewGuid();
+        const string boot="0123456789abcdef";
+        var json=System.Text.Json.JsonSerializer.Serialize(new {version=1,boot_id=boot,request_id=id.ToString("N"),seq=1,accepted=false,reason,uptime_ms=11,batch_id=""});
+        var ack=GatewayWire.Ack(WireProtocol.Json(json));
+        Assert.False(ack.Accepted);
+        Assert.Equal(reason,ack.Reason);
+        Assert.Equal(id,ack.RequestId);
+        var inconsistent=System.Text.Json.JsonSerializer.Serialize(new {version=1,boot_id=boot,request_id=id.ToString("N"),seq=1,accepted=true,reason,uptime_ms=11,batch_id=""});
+        Assert.Throws<FormatException>(()=>GatewayWire.Ack(WireProtocol.Json(inconsistent)));
+    }
+
+    [Theory]
+    [InlineData("1")]
+    [InlineData("pulse")]
+    [InlineData("arm")]
+    [InlineData("capture")]
+    [InlineData("no2 start")]
+    [InlineData("dose")]
+    public void LegacyAndRawActuationActionsAreNotGatewayCommands(string action)
+    {
+        Assert.Null(WaterBenchSession.BuildCommand(new BenchCommand(Guid.NewGuid(),action,Id:1,Mask:1,CaptureId:1)));
+    }
 }
