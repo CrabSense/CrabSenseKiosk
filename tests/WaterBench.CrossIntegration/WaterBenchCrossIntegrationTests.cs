@@ -105,7 +105,7 @@ public sealed class WaterBenchCrossIntegrationTests
         public void PopulateFeature(IEnumerable<ApplicationPart> parts,ControllerFeature feature)
         {
             var allowed=new[]{typeof(WaterBenchBatchEdgeController),typeof(WaterBenchMediaController),
-                typeof(WaterBenchNh3EdgeController),typeof(WaterBenchReceiptController),typeof(WaterBenchBatchController),typeof(WaterBenchNh3Controller)};
+                typeof(WaterBenchNh3EdgeController),typeof(WaterBenchReceiptController),typeof(WaterBenchBatchController),typeof(WaterBenchNh3Controller),typeof(MediaController)};
             foreach(var c in feature.Controllers.Where(c=>!allowed.Contains(c.AsType())).ToArray())feature.Controllers.Remove(c);
         }
     }
@@ -116,6 +116,8 @@ public sealed class WaterBenchCrossIntegrationTests
         public int Uploads,Reads,PrivateChecks,Deletes;
         public bool CorruptNextRead;
         public int Count=>_files.Count;
+        public byte[] Snapshot(string key)=>_files[key].ToArray();
+        public void Replace(string key,byte[] bytes)=>_files[key]=bytes.ToArray();
         public async Task<MediaUploadResult> UploadAsync(Stream data,string fileName,string contentType,string category,CancellationToken ct=default,bool publicRead=false)
         {
             Assert.False(publicRead);Assert.Equal("image/jpeg",contentType);Assert.Contains("04_PhanTichNuoc",category);
@@ -142,6 +144,7 @@ public sealed class WaterBenchCrossIntegrationTests
             s.AddScoped<IUnitOfWork,UnitOfWork>();s.AddScoped<IKioskProvisioningService,KioskProvisioningService>();
             s.AddScoped<ICurrentUserService,CrabSenseBE.Api.Services.CurrentUserService>();
             s.AddSingleton<IMediaStorageService>(storage);
+            s.AddScoped<IMediaService,MediaService>();
             s.AddSingleton<IReadOnlyDictionary<Guid,UserRole>>(new Dictionary<Guid,UserRole>{
                 [f.Admin]=UserRole.FarmAdministrator,[f.Outsider]=UserRole.FarmAdministrator,
                 [f.Manager]=UserRole.FarmManager,[f.Staff]=UserRole.FarmStaff,[f.System]=UserRole.SystemAdministrator});
@@ -310,6 +313,58 @@ public sealed class WaterBenchCrossIntegrationTests
             Assert.Equal(3,await db.MediaAssets.CountAsync(x=>x.DeviceId==f.Camera&&!x.IsShared));
             Assert.Empty(await db.WaterBenchResultAssessments.ToListAsync());Assert.Empty(await db.WaterAnalysisRuns.Where(x=>x.FarmingAreaId==f.Area).ToListAsync());
             Assert.Equal(3,Directory.GetFiles(root,"*.jpg").Length);
+            // M05: authenticate and authorize before any storage IO; verify the exact returned bytes.
+            var asset=await db.MediaAssets.SingleAsync(x=>x.DeviceId==f.Camera&&x.Notes!.EndsWith(":NO2:1"));
+            var receipt=await db.WaterBenchEvidence.SingleAsync(x=>x.StationId==f.Station&&x.Kind=="jpeg"&&x.Analyte=="NO2");
+            var mediaPath=$"/api/media/{asset.Id}/content";
+            var original=storage.Snapshot(asset.StorageKey);
+            var reads=storage.Reads;var checks=storage.PrivateChecks;
+            using(var denied=await Get(direct,mediaPath))Assert.Equal(HttpStatusCode.Unauthorized,denied.StatusCode);
+            foreach(var user in new[]{f.Outsider,f.System})
+            {using var denied=await Get(direct,mediaPath,user);Assert.Equal(HttpStatusCode.Forbidden,denied.StatusCode);}
+            Assert.Equal(reads,storage.Reads);Assert.Equal(checks,storage.PrivateChecks);
+            foreach(var user in new[]{f.Admin,f.Manager,f.Staff})
+            {using var ok=await Get(direct,mediaPath,user);Assert.Equal(HttpStatusCode.OK,ok.StatusCode);Assert.Equal(original,await ok.Content.ReadAsByteArrayAsync());}
+            var altered=original.ToArray();altered[altered.Length/2]^=1;
+            try
+            {
+                foreach(var bytes in new[]{altered,original[..^1],original.Concat(new byte[]{0}).ToArray()})
+                {
+                    storage.Replace(asset.StorageKey,bytes);
+                    using var rejected=await Get(direct,mediaPath,f.Admin);
+                    Assert.Equal(HttpStatusCode.Conflict,rejected.StatusCode);
+                }
+            }
+            finally{storage.Replace(asset.StorageKey,original);}
+            var digest=receipt.PayloadSha256;
+            try
+            {
+                receipt.PayloadSha256=new string('0',64);await db.SaveChangesAsync();
+                reads=storage.Reads;
+                using(var rejected=await Get(direct,mediaPath,f.Admin))Assert.Equal(HttpStatusCode.Conflict,rejected.StatusCode);
+                Assert.Equal(reads,storage.Reads);
+            }
+            finally{receipt.PayloadSha256=digest;await db.SaveChangesAsync();}
+            var capture=receipt.CaptureId;
+            try
+            {
+                receipt.CaptureId=65536;await db.SaveChangesAsync();
+                reads=storage.Reads;
+                using(var rejected=await Get(direct,mediaPath,f.Admin))Assert.Equal(HttpStatusCode.Conflict,rejected.StatusCode);
+                Assert.Equal(reads,storage.Reads);
+            }
+            finally{receipt.CaptureId=capture;await db.SaveChangesAsync();}
+            try
+            {
+                asset.IsShared=true;await db.SaveChangesAsync();
+                reads=storage.Reads;
+                using(var rejected=await Get(direct,mediaPath,f.Admin))Assert.Equal(HttpStatusCode.Conflict,rejected.StatusCode);
+                Assert.Equal(reads,storage.Reads);
+            }
+            finally{asset.IsShared=false;await db.SaveChangesAsync();}
+            using(var restored=await Get(direct,mediaPath,f.Admin))
+            {Assert.Equal(HttpStatusCode.OK,restored.StatusCode);Assert.Equal(original,await restored.Content.ReadAsByteArrayAsync());}
+            Assert.Equal(3,storage.Count);Assert.Equal(16,await db.WaterBenchEvidence.CountAsync(x=>x.StationId==f.Station));
             // Command and cleaning may share the same request/run GUID, but not their stream identity.
             var auditId=Guid.NewGuid();var auditConnection=Guid.NewGuid();var auditAt=DateTimeOffset.UtcNow;
             var command=new BenchCommand(auditId,"cleanStart",Mask:1);
