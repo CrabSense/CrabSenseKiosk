@@ -101,11 +101,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: CrabSense/CrabSenseBE
-          ref: 66487500b1a8b26b4c0e5105430ff17923567d9a
+          ref: 6e1fd8dfb5fd3cec243a9d9c8f4a59063b38d471
           path: tests/_backend
           persist-credentials: false
       - name: Verify Backend pin
-        run: test "$(git -C tests/_backend rev-parse HEAD)" = 66487500b1a8b26b4c0e5105430ff17923567d9a
+        run: test "$(git -C tests/_backend rev-parse HEAD)" = 6e1fd8dfb5fd3cec243a9d9c8f4a59063b38d471
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
